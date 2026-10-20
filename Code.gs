@@ -1,0 +1,1033 @@
+/* 서가 — 구글 시트 연결부.
+   로그인은 구글 계정입니다. 웹 앱은 반드시
+     실행: 나(배포한 사람) / 액세스: [학교 도메인] 내 모든 사용자
+   로 배포해야 접속한 사람의 이메일을 읽을 수 있습니다.
+   처음 한 번: 편집기에서 setup 함수를 실행(또는 시트 메뉴 [서가 > 처음 설정]). */
+
+var SHEET_ID="";   /* 시트의 [확장 프로그램 > Apps Script] 로 만들면 비워 둬도 된다 */
+function ss_(){
+  var a=null;try{a=SpreadsheetApp.getActiveSpreadsheet();}catch(e){}
+  return a||SpreadsheetApp.openById(SHEET_ID);
+}
+/* 알림 창(alert)은 누가 '확인'을 누를 때까지 실행을 붙잡으므로 쓰지 않는다.
+   실행 기록(로그)에 남기고, 시트가 열려 있으면 오른쪽 아래에 잠깐 띄운다 */
+function say_(msg){
+  console.log(msg);
+  try{var a=SpreadsheetApp.getActiveSpreadsheet();if(a)a.toast(String(msg).slice(0,380),"서가",20);}catch(e){}
+}
+
+function onOpen(){
+  /* 시트에 딸린 스크립트가 아니어도 뜨도록 onOpen 시계를 걸어 두는데,
+     딸린 경우에는 둘 다 불려 메뉴가 두 벌 생긴다. 20초 안의 두 번째는 건너뛴다 */
+  try{var c=CacheService.getUserCache();if(c.get("menu"))return;c.put("menu","1",20);}catch(e){}
+  SpreadsheetApp.getUi().createMenu("서가")
+    .addItem("지금 백업하기 (사본 만들기)","backupNow")
+    .addItem("처음 설정 (시트 만들기)","setup")
+    .addItem("지난달 상품권 메일 지금 보내기","giftMailNow")
+    .addItem("독서로 소장·대출 지금 확인","libDaily")
+    .addItem("이번 달 추천 도서 다시 뽑기","rotateNow")
+    .addItem("이번 주 북퀴즈 빈자리 채우기","quizNow")
+    .addItem("시트 고친 것 지금 반영","refreshNow")
+    .addItem("들어가는 주소 보기 (시작 탭)","appUrlShow")
+    .addItem("시트 쓰는 법 다시 쓰기 (안내 탭)","sheetDocNow")
+    .addItem("독서로 연결 시험","libTest")
+    .addToUi();
+}
+
+/* 배포할 때마다 tools/deploy.py 가 바꾸는 판 표시. 새 판이 처음 열리면 뒷정리(firstRun)를 한 번 예약한다 */
+var CODE_VERSION="20261020-165428";
+/* tools/.testkey 의 열쇠인지 (해시만 코드에 둔다) */
+function keyOk_(v){
+  return Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256,String(v),Utilities.Charset.UTF_8)
+    .map(function(b){return ("0"+((b+256)%256).toString(16)).slice(-2);}).join("")===TEST_KEY_HASH;
+}
+function doGet(e){
+  try{
+    var props=PropertiesService.getScriptProperties();
+    /* 새 판이 처음 열리면 10분 제한 없이 바로 뒷정리를 예약(판마다 한 번) */
+    if(props.getProperty("codeVer")!==CODE_VERSION&&props.getProperty("kickVer")!==CODE_VERSION){props.setProperty("kickVer",CODE_VERSION);props.deleteProperty("kickAt");kick_();}
+  }catch(x){}
+  /* 올린 판으로 시트를 바로 갈아 준다(시계가 돌기를 1~2분 기다리지 않게).
+     tools/deploy.py 가 올린 직후 한 번 부른다 */
+  if(e&&e.parameter&&e.parameter.migrate){
+    var m={};
+    if(!keyOk_(e.parameter.migrate))m={error:"열쇠가 맞지 않습니다."};
+    else{
+      var t0=Date.now();
+      try{installTrigger_();}catch(x){m.시계=x.message;}
+      try{applySheetUi_();}catch(x){m.시트모양=x.message;}
+      try{Core.make(makeDb_(),makeEnv_()).maintain();}catch(x){m.정리=x.message;}
+      try{tidySheets_();}catch(x){}   /* 옮기고 비운 옛 탭을 그 자리에서 정리 */
+      try{m.캐시채움=makeDb_().warm(PRELOAD_);}catch(x){}   /* 시트 갈이로 판이 바뀐 표를 미리 캐시에(배포 직후 첫 사람이 10초 기다리지 않게) */
+      if(e.parameter.recv)markRecvDirty_();
+      /* &sweep=N: 장서 보충(분류 없는 책 찾기)을 지금 N 음절 */
+      if(e.parameter.sweep){var lks=LockService.getScriptLock();
+        try{lks.waitLock(20000);LOCK_HELD_=true;m.장서보충=Core.make(makeDb_(),makeEnv_()).sweepCatalog(Number(e.parameter.sweep)||120);}catch(x){m.장서보충=x.message;}
+        finally{LOCK_HELD_=false;try{lks.releaseLock();}catch(x){}}}   /* &recv=1: 수령대상 시트를 1분 안에 다시 쓰게 */
+      /* &authors=1: 작가 이야기 소개를 지금 25명 받아 보기(위키백과가 막는지 확인용). 쓰기라 잠그고 */
+      if(e.parameter.authors){var lka=LockService.getScriptLock();
+        try{lka.waitLock(20000);LOCK_HELD_=true;var cA=Core.make(makeDb_(),makeEnv_());m.작가=cA.fillAuthors(25);
+          var dbA=makeDb_(),rA=dbA.rows("작가");m.작가줄=rA.length;m.작가소개=rA.filter(function(r){return String(r["소개"]).trim();}).length;}
+        catch(x){m.작가=x.message;}
+        finally{LOCK_HELD_=false;try{lka.releaseLock();}catch(x){}}}
+      /* &photos=1: 빈 작가 얼굴을 지금 채우기(위키데이터·영어 위키백과). 쓰기라 잠그고 */
+      if(e.parameter.photos){var lkp=LockService.getScriptLock();
+        try{lkp.waitLock(20000);LOCK_HELD_=true;m.작가사진=Core.make(makeDb_(),makeEnv_()).fillPhotos(true);
+          var rP=makeDb_().rows("작가").filter(function(r){return String(r["소개"]).trim();});m.소개있는작가=rP.length;m.사진있는작가=rP.filter(function(r){return String(r["사진"]).trim();}).length;}
+        catch(x){m.작가사진=x.message;}
+        finally{LOCK_HELD_=false;try{lkp.releaseLock();}catch(x){}}}
+      /* &quiz=1: 이번 주 북퀴즈 채우기·다음 주 책 정하기를 지금(시계를 기다리지 않고). 쓰기라 잠그고 */
+      if(e.parameter.quiz){var lkq=LockService.getScriptLock();
+        try{lkq.waitLock(20000);LOCK_HELD_=true;m.퀴즈=Core.make(makeDb_(),makeEnv_()).ensureWeeklyQuiz();}catch(x){m.퀴즈=x.message;}
+        finally{LOCK_HELD_=false;try{lkq.releaseLock();}catch(x){}}}
+      try{PropertiesService.getScriptProperties().setProperty("codeVer",CODE_VERSION);}catch(x){}
+      m.codeVer=CODE_VERSION;m.ms=Date.now()-t0;
+    }
+    return ContentService.createTextOutput(JSON.stringify(m)).setMimeType(ContentService.MimeType.JSON);
+  }
+  /* 사본(백업) 만들기. 드라이브 권한이 승인됐는지도 여기서 드러난다 */
+  if(e&&e.parameter&&e.parameter.backup){
+    var b={};
+    if(!keyOk_(e.parameter.backup))b={error:"열쇠가 맞지 않습니다."};
+    else{
+      try{b.name=backupMonthly_(true);b.where=backupFolderUrl_();}catch(x){b.error=String(x&&x.message||x);}
+      /* 드라이브 권한이 실제로 왔는지, 지금 어느 계정으로 도는지 확인용 */
+      try{DriveApp.getRootFolder().getName();b.drive="ok";}catch(x2){b.drive=String(x2&&x2.message||x2).slice(0,120);}
+      try{b.asUser=Session.getEffectiveUser().getEmail();}catch(x3){b.asUser="(알 수 없음)";}
+      /* 폴더에 실제로 무엇이 들어 있는지 */
+      try{
+        var db9=makeDb_(),want9="";
+        db9.rows("설정").forEach(function(r){if(String(r["항목"]).trim()==="백업폴더")want9=String(r["값"]);});
+        var fd=backupFolder_(want9),fi=fd.getFiles(),names=[];
+        while(fi.hasNext()&&names.length<30)names.push(fi.next().getName());
+        names.sort();b.folder=fd.getName();b.files=names;
+      }catch(x4){b.files=String(x4&&x4.message||x4).slice(0,120);}
+      if(BACKUP_ERR)b.copyErr=BACKUP_ERR;
+      if(e.parameter.keep){try{
+        var dbK=makeDb_(),wantK="";
+        dbK.rows("설정").forEach(function(r){if(String(r["항목"]).trim()==="백업폴더")wantK=String(r["값"]);});
+        tidyBackups_(backupFolder_(wantK),ss_().getId(),Number(e.parameter.keep));
+      }catch(x6){b.keepErr=String(x6&&x6.message||x6).slice(0,120);}}
+      /* 지금 토큰에 실제로 어떤 권한이 붙어 있는지(승인 화면에서 무엇이 빠졌는지 바로 보인다) */
+      try{
+        var ti=UrlFetchApp.fetch("https://oauth2.googleapis.com/tokeninfo?access_token="+encodeURIComponent(ScriptApp.getOAuthToken()),{muteHttpExceptions:true});
+        var js=JSON.parse(ti.getContentText()||"{}");
+        b.scopes=String(js.scope||"").split(" ").map(function(x){return x.replace("https://www.googleapis.com/auth/","");}).sort();
+      }catch(x5){b.scopes=String(x5&&x5.message||x5).slice(0,100);}
+    }
+    return ContentService.createTextOutput(JSON.stringify(b)).setMimeType(ContentService.MimeType.JSON);
+  }
+  /* 설정 한 칸을 시트에서 바로 읽은 값과, 앱이 캐시로 보는 값을 나란히(읽기만, 열쇠 필요) */
+  if(e&&e.parameter&&e.parameter.peek){
+    var pk={};
+    if(!keyOk_(e.parameter.peek))pk={error:"열쇠가 맞지 않습니다."};
+    else{try{
+      var want=String(e.parameter.k||"백업");
+      var book=e.parameter.id?SpreadsheetApp.openById(String(e.parameter.id)):ss_();
+      pk.book=book.getName();pk.bookId=book.getId();pk.liveId=SHEET_ID;
+      try{var act=SpreadsheetApp.getActiveSpreadsheet();pk.active=act?act.getId():"(없음)";}catch(xa){pk.active="(오류)";}
+      var sh=book.getSheetByName("설정"),v=sh.getDataRange().getValues();
+      for(var i=1;i<v.length;i++)if(String(v[i][0]).trim()===want){pk.sheet=String(v[i][1]);pk.row=i+1;}
+      if(!e.parameter.id){var db8=makeDb_();db8.rows("설정").forEach(function(r){if(String(r["항목"]).trim()===want){pk.cache=String(r["값"]);pk.cacheRow=r._row;}});}
+      pk.ver=PropertiesService.getScriptProperties().getProperty("sv|설정")||"";
+      if(e.parameter.find){var f=String(e.parameter.find);pk.found=[];
+        for(var j=0;j<v.length;j++)for(var c=0;c<v[j].length;c++)if(String(v[j][c]).indexOf(f)>=0)pk.found.push({row:j+1,col:c+1,key:String(v[j][0]),val:String(v[j][c]).slice(0,90)});}
+      pk.rows=v.length;
+      /* 이벤트 시트(당첨·기록 칸은 빼고): &events=1 */
+      if(e.parameter.events){pk.events=makeDb_().rows("이벤트").map(function(r){return {이름:String(r["이름"]),방식:String(r["방식"]),시작:String(r["시작"]),끝:String(r["끝"]),값:String(r["값"]),보상:String(r["보상"]),대상:String(r["대상"]),종류:String(r["종류"]),메모:String(r["메모"]),숨김:String(r["숨김"])};});
+        pk.giftConf={};["상품권당별","별당도장","월최대매수","상품권금액","수령시작월","상품권배부","상품권배부장소","주간도장"].forEach(function(k){makeDb_().rows("설정").forEach(function(r){if(String(r["항목"]).trim()===k)pk.giftConf[k]=String(r["값"]);});});
+        pk.recv=makeDb_().rows("수령기간").map(function(r){return [String(r["시작"]),String(r["끝"]),String(r["메모"])];});
+        pk.notices=makeDb_().rows("공지").map(function(r){return [String(r["제목"]),String(r["내용"]).slice(0,120),String(r["고정"]),String(r["숨김"])];});}
+      /* 글 종류별 수(이름·학번 없이 숫자만): 문장이 다른 종류로 보이는지 살필 때 */
+      if(e.parameter.kinds){var km={};makeDb_().rows("글").forEach(function(r){var k=JSON.stringify(String(r["종류"]))+"|"+String(r["상태"])+"|"+(String(r["반"])==="선생님"?"교사":"학생");km[k]=(km[k]||0)+1;});pk.kinds=km;}
+      /* 잠근 채 새로 읽어 거르는 길을 실제로 한 번(기기: 풀렸거나 만료된 것만 지운다 — 아침 7시 정리와 같음) */
+      if(e.parameter.prune==="기기"){
+        var db7=makeDb_(),td7=Utilities.formatDate(new Date(),"Asia/Seoul","yyyy-MM-dd");
+        var before7=db7.rows("기기").length;
+        pk.pruned=db7.prune("기기",function(r){return String(r["해제"]).trim()!=="Y"&&String(r["만료"]).trim()>=td7;});
+        pk.devBefore=before7;pk.devAfter=makeDb_().rows("기기").length;
+        pk.sheetRows=ss_().getSheetByName("기기").getLastRow()-1;
+      }
+    }catch(x){pk={error:String(x&&x.message||x)};}}
+    return ContentService.createTextOutput(JSON.stringify(pk)).setMimeType(ContentService.MimeType.JSON);
+  }
+  /* 학교 장서목록 내려받기(읽기만, 열쇠 필요): ?catalog=<열쇠> — 서명·지은이·출판사·ISBN(소장 도서 목록, 개인정보 없음). 미소장 추천도서 대조용 */
+  if(e&&e.parameter&&e.parameter.catalog){
+    var cg={};
+    if(!keyOk_(e.parameter.catalog))cg={error:"열쇠가 맞지 않습니다."};
+    else{try{cg={rows:makeDb_().rows("장서목록").map(function(r){return [String(r["제목"]),String(r["지은이"]),String(r["출판사"]),String(r["ISBN"])];})};}
+      catch(x){cg={error:String(x&&x.message||x)};}}
+    return ContentService.createTextOutput(JSON.stringify(cg)).setMimeType(ContentService.MimeType.JSON);
+  }
+  /* 작가별 소장 종수(읽기만, 열쇠 필요): ?libauth=<열쇠> — 작가 이름은 공개 정보 */
+  if(e&&e.parameter&&e.parameter.libauth){
+    var la={};
+    if(!keyOk_(e.parameter.libauth))la={error:"열쇠가 맞지 않습니다."};
+    else{try{var cL=Core.make(makeDb_(),makeEnv_()),L2=cL.libAuthors(2),prof={};
+      makeDb_().rows("작가").forEach(function(r){if(String(r["소개"]).trim())prof[String(r["이름"]).replace(/\s/g,"")]=1;});
+      la={n2:L2.length,n3:L2.filter(function(x){return x.n>=3;}).length,n5:L2.filter(function(x){return x.n>=5;}).length,n10:L2.filter(function(x){return x.n>=10;}).length,
+        withProfile:L2.filter(function(x){return prof[String(x.name).replace(/\s/g,"")];}).length,top:L2.slice(0,60),tail:L2.slice(-15)};}
+      catch(x){la={error:String(x&&x.message||x)};}}
+    return ContentService.createTextOutput(JSON.stringify(la)).setMimeType(ContentService.MimeType.JSON);
+  }
+  /* 상품권 규칙 견주기(읽기만, 숫자만, 열쇠 필요): ?giftsim=<열쇠> */
+  if(e&&e.parameter&&e.parameter.giftsim){
+    var gs={};
+    if(!keyOk_(e.parameter.giftsim))gs={error:"열쇠가 맞지 않습니다."};
+    else{try{gs=Core.make(makeDb_(),makeEnv_()).giftSim([1,2]);}catch(x){gs={error:String(x&&x.message||x)};}}
+    return ContentService.createTextOutput(JSON.stringify(gs)).setMimeType(ContentService.MimeType.JSON);
+  }
+  /* 한눈에 보기 자료만 뽑아 보기(읽기만, 열쇠 필요) */
+  if(e&&e.parameter&&e.parameter.overview){
+    var ov={};
+    if(!keyOk_(e.parameter.overview))ov={error:"열쇠가 맞지 않습니다."};
+    else{try{
+      var core1=Core.make(makeDb_(),makeEnv_());
+      ov=core1.overview({role:"admin",kind:"admin",grade:"",name:"점검"},Number(e.parameter.weeks)||8,Number(e.parameter.days)||14);
+    }catch(x){ov={error:String(x&&x.message||x)};}}
+    return ContentService.createTextOutput(JSON.stringify(ov)).setMimeType(ContentService.MimeType.JSON);
+  }
+  /* 실제 데이터 점검(읽기만). tools/.testkey 의 열쇠가 있어야 열린다 */
+  if(e&&e.parameter&&e.parameter.selftest){
+    var res;
+    if(!keyOk_(e.parameter.selftest))res={error:"열쇠가 맞지 않습니다."};
+    else{try{var db0=makeDb_(),env0=makeEnv_(),s0=Date.now();Core.make(db0,env0).api;var core0=Core.make(db0,env0);var tl=Date.now();res=core0.selfTest(200000);res.timing.loadMs=tl-s0;}catch(x){res={error:String(x&&x.stack||x)};}}
+    return ContentService.createTextOutput(JSON.stringify(res)).setMimeType(ContentService.MimeType.JSON);
+  }
+  /* 공지 점검(읽기만, 열쇠 필요): ?notices=<열쇠> — 공지 시트 제목·내용·숨김(학교 안내문, 개인정보 없음) */
+  if(e&&e.parameter&&e.parameter.notices){
+    var nt={};
+    if(!keyOk_(e.parameter.notices))nt={error:"열쇠가 맞지 않습니다."};
+    else{try{nt={rows:makeDb_().rows("공지").map(function(r){var o={};Object.keys(r).forEach(function(k){if(k!=="_row")o[k]=String(r[k]).slice(0,600);});return o;})};}catch(x){nt={error:String(x&&x.message||x)};}}
+    return ContentService.createTextOutput(JSON.stringify(nt)).setMimeType(ContentService.MimeType.JSON);
+  }
+  /* 속도 점검(읽기만, 열쇠 필요): ?perf=<열쇠>&at=2026-10-16T12:30 — 그 시각(한국 시간)으로 화면 계산 시간만 잰다. 쓰지 않음 */
+  if(e&&e.parameter&&e.parameter.perf){
+    var pf={};
+    if(!keyOk_(e.parameter.perf))pf={error:"열쇠가 맞지 않습니다."};
+    else{try{var t0=Date.now(),dbP=makeDb_(),envP=makeEnv_(),at=e.parameter.at?new Date(String(e.parameter.at)+":00+09:00"):null;
+      if(at&&!isNaN(at.getTime()))envP.now=function(){return at;};
+      ["명단","글","도장","퀴즈","지급","수령기간","도서","설정"].forEach(function(t){dbP.rows(t);});pf.loadMs=Date.now()-t0;
+      var tc=Date.now();pf=Object.assign(pf,Core.make(dbP,envP).perfCheck(Number(e.parameter.n)||30));pf.coreMs=Date.now()-tc;pf.at=at?String(e.parameter.at):"지금";}
+      catch(x){pf={error:String(x&&x.message||x)};}}
+    return ContentService.createTextOutput(JSON.stringify(pf)).setMimeType(ContentService.MimeType.JSON);
+  }
+  /* 반 전원 가입 시각 바로잡기(2026-10-19): 백업 시트들에서 반마다 '처음 전원이 된' 때를 찾는다. 결과는 반·시각만.
+     ?cjfix=<열쇠> 는 보기만, &apply=1 이면 설정 '반전원가입'에 적는다 */
+  if(e&&e.parameter&&e.parameter.cjfix){
+    var cf={};
+    if(!keyOk_(e.parameter.cjfix))cf={error:"열쇠가 맞지 않습니다."};
+    else{try{
+      var dbC=makeDb_(),confC={};dbC.rows("설정").forEach(function(r){confC[String(r["항목"]).trim()]=String(r["값"]);});
+      var folder=backupFolder_(confC["백업폴더"]),it=folder.getFiles(),files=[];
+      while(it.hasNext()){var f=it.next();var m=/백업 (\d{4}-\d{2}-\d{2})( \d{4})?/.exec(f.getName());if(m&&f.getMimeType()===MimeType.GOOGLE_SHEETS)files.push({id:f.getId(),name:m[1]+(m[2]||""),d:m[1]});}
+      files.sort(function(x,y){return x.name<y.name?-1:1;});
+      var first={},seenIn={},DT=/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/;
+      function tx(v){return v instanceof Date?Utilities.formatDate(v,"Asia/Seoul","yyyy-MM-dd HH:mm:ss"):String(v==null?"":v).trim();}
+      files.forEach(function(F){
+        var sh=SpreadsheetApp.openById(F.id).getSheetByName("명단");if(!sh)return;
+        var v=sh.getDataRange().getValues(),h=v[0].map(String),ic=h.indexOf("반"),ih=h.indexOf("학번"),ia=h.indexOf("동의"),ip=h.indexOf("핀설정");
+        var cl={};
+        for(var i=1;i<v.length;i++){var cls=tx(v[i][ic]),hb=tx(v[i][ih]);if(!cls||!hb||cls==="선생님")continue;
+          var o=cl[cls]||(cl[cls]={n:0,reg:0,at:""});o.n++;
+          var ag=ia>=0?tx(v[i][ia]):"",pt=ip>=0?tx(v[i][ip]):"",fst=DT.test(ag)?ag:pt;
+          if(pt||DT.test(ag)){o.reg++;if(fst>o.at)o.at=fst;}}
+        Object.keys(cl).forEach(function(c){var o=cl[c];if(o.n>=2&&o.reg>=o.n&&o.at&&!first[c]){first[c]=o.at;seenIn[c]=F.name;}});
+      });
+      var core=Core.make(dbC,makeEnv_()),rec={};try{rec=JSON.parse(confC["반전원가입"]||"{}");}catch(x){}
+      var now=core.speedOne("classjoin",true)||{};
+      var out={},apply={};
+      Object.keys(now).forEach(function(c){var b=first[c]||"";apply[c]=b&&b<now[c]?b:now[c];out[c]="지금 "+now[c]+" · 기록 "+(rec[c]||"-")+" · 백업에서 처음 전원 "+(b||"-")+(seenIn[c]?"("+seenIn[c]+" 백업)":"")+" → "+apply[c];});
+      cf={백업:files.map(function(f){return f.name;}),반:out};
+      if(e.parameter.apply==="1"){var lk=LockService.getScriptLock();lk.waitLock(20000);try{LOCK_HELD_=true;dbC.setConf("반전원가입",JSON.stringify(apply));cf.적용=true;}finally{LOCK_HELD_=false;lk.releaseLock();}}
+    }catch(x){cf={error:String(x&&x.stack||x)};}}
+    return ContentService.createTextOutput(JSON.stringify(cf)).setMimeType(ContentService.MimeType.JSON);
+  }
+  /* 실제 요청 한 번을 쪼개 잰다(읽기만, 열쇠 필요): ?speed=<열쇠>&who=student|club|admin */
+  if(e&&e.parameter&&e.parameter.speed){
+    var sp={};
+    if(!keyOk_(e.parameter.speed))sp={error:"열쇠가 맞지 않습니다."};
+    else{try{var s0=Date.now(),dbS=makeDb_();if(e.parameter.pre!=="0")dbS.preload(PRELOAD_);sp.makeDb=Date.now()-s0;s0=Date.now();var envS=makeEnv_();sp.makeEnv=Date.now()-s0;
+      var raw=dbS.rows,seen={},tl=[];dbS.rows=function(t){if(seen[t])return raw(t);var a=Date.now(),r=raw(t);seen[t]=1;tl.push(t+":"+(Date.now()-a));return r;};
+      s0=Date.now();var sz=Core.make(dbS,envS).speedOne(String(e.parameter.who||"student"),e.parameter.dump==="1",Number(e.parameter.i)||0);if(e.parameter.dump==="1")return ContentService.createTextOutput(JSON.stringify(sz)).setMimeType(ContentService.MimeType.JSON);sp.total=Date.now()-s0;sp.tables=tl.join(" ");
+      sp.bytes=sz?Object.keys(sz).map(function(k){return k+":"+sz[k];}).filter(function(x){return Number(x.split(":")[1])>2000;}).join(" "):"";}
+      catch(x){sp={error:String(x&&x.stack||x)};}}
+    return ContentService.createTextOutput(JSON.stringify(sp)).setMimeType(ContentService.MimeType.JSON);
+  }
+  if(e&&e.parameter&&e.parameter.status){
+    var st={};
+    try{st=Core.make(makeDb_(),makeEnv_()).status();}catch(x){st={error:String(x&&x.message||x)};}
+    st.code=CODE_VERSION;st.codeVer=PropertiesService.getScriptProperties().getProperty("codeVer")||"";
+    var trg=ScriptApp.getProjectTriggers();
+    st.firstRunPending=trg.some(function(t){return t.getHandlerFunction()==="firstRun";});
+    st.triggers=trg.map(function(t){return t.getHandlerFunction();}).sort().join(",");
+    /* 도서부 표시(값 종류·인원)와 배부 화면 요약 — 개인정보 없이 숫자만 */
+    try{var vals={};makeDb_().rows("명단").forEach(function(r){var v=String(r["도서부"]).trim();if(v)vals[v]=(vals[v]||0)+1;});st.club=vals;
+      var dv=Core.make(makeDb_(),makeEnv_()).deskSummary();st.desk=dv;}catch(x){st.club=String(x&&x.message||x);}
+    try{var ER=makeDb_().rows("화면오류");st.screenErr={n:ER.length,last:ER.length?String(ER[ER.length-1]["시각"])+" "+String(ER[ER.length-1]["탭"])+" "+String(ER[ER.length-1]["내용"]).slice(0,120):""};}catch(x){}
+    st.recvAt=PropertiesService.getScriptProperties().getProperty("recvAt")||"";st.recvDirty=!!PropertiesService.getScriptProperties().getProperty("recvDirty");
+    try{st.sheets=SpreadsheetApp.getActive().getSheets().map(function(sh){return sh.getName()+":"+sh.getLastRow();});}catch(x){}
+    return ContentService.createTextOutput(JSON.stringify(st)).setMimeType(ContentService.MimeType.JSON);
+  }
+  return HtmlService.createHtmlOutputFromFile("index")
+    .setTitle("서가")
+    .addMetaTag("viewport","width=device-width, initial-scale=1");
+}
+
+/* 화면에서 부르는 단 하나의 입구 */
+/* 오래 걸리는 작업(독서로 확인·추천 도서 뽑기·퀴즈 채우기)은 한 번에 하나만.
+   스크립트 잠금은 학생 제출에도 쓰이므로 잠깐만 잡고 '작업 중' 표시(10분 유효)를 남긴다 */
+function job_(fn){
+  var lock=LockService.getScriptLock(),props=PropertiesService.getScriptProperties(),now=Date.now();
+  lock.waitLock(20000);
+  try{
+    var busy=Number(props.getProperty("jobAt")||0);
+    if(busy&&now-busy<10*60*1000)throw new Error("다른 독서로 확인이 진행 중입니다. 1~3분 뒤 다시 해 주세요.");
+    props.setProperty("jobAt",String(now));
+  }finally{lock.releaseLock();}
+  try{return fn();}finally{props.deleteProperty("jobAt");}
+}
+/* 새 판을 붙여넣은 뒤 처음 열리면: 새 방식 추천 도서 뽑기를 곧바로 한 번 예약한다(다음 7·15·0시를 기다리지 않게) */
+function kick_(){
+  var props=PropertiesService.getScriptProperties(),at=Number(props.getProperty("kickAt")||0);
+  if(Date.now()-at<10*60*1000)return;
+  if(ScriptApp.getProjectTriggers().some(function(t){return t.getHandlerFunction()==="firstRun";}))return;
+  props.setProperty("kickAt",String(Date.now()));
+  ScriptApp.newTrigger("firstRun").timeBased().after(5000).create();
+}
+function api(name,json){
+  var p={};try{p=JSON.parse(json||"{}");}catch(e){}
+  var want=!!p._state&&name!=="state";delete p._state;
+  /* 독서로 전체 확인은 20~40초 걸려서, 그동안 학생 제출을 막지 않도록 잠그지 않는다 */
+  var write=["state","libRefresh","libSearch","rotate","catalogNow"].indexOf(name)<0;
+  var lock=write?LockService.getScriptLock():null,db=null,env=null,out,err=null;
+  try{
+    if(lock){lock.waitLock(20000);LOCK_HELD_=true;}
+    db=makeDb_();db.preload(PRELOAD_);env=makeEnv_();
+    var run=function(){return Core.make(db,env).api(name,p);};
+    out=["libRefresh","rotate","quizAuto","catalogNow"].indexOf(name)>=0?job_(run):run();
+    if(lock)db.flush();
+  }catch(e){err=String(e&&e.message||e);}
+  finally{if(lock){LOCK_HELD_=false;try{lock.releaseLock();}catch(e){}}}
+  if(err)return JSON.stringify({error:err});
+  if(write&&name!=="state"&&RECV_QUIET_.indexOf(name)<0)markRecvDirty_();   /* 별이 바뀌었을 수 있다 → 1분 안에 수령대상 시트를 다시 */
+  if(out==null)out={ok:true};
+  var st=name==="state"?out:null;
+  if(want){try{st=Core.make(db,env).api("state",{_t:p._t,as:p._as});out={r:out,state:st};}catch(e){}}
+  if(st&&st.conf&&st.conf.upToDate===false)try{kick_();}catch(e){}
+  return JSON.stringify(out);
+}
+
+/* 이 실행에서 한 번 읽은 스크립트 속성(시트 판 번호와 비밀 열쇠를 한 번에) */
+var PROPS_=null;
+/* 화면 요청마다 거의 늘 읽는 표: 캐시에서 한 번에 미리 */
+var PRELOAD_=["명단","교사","교사신청","기기","안내확인","설정","글","반응","도서","퀴즈","주제","이벤트","도장","퀴즈응답","수령기간","지급","문장","건의","공지","작가","권장도서","배부기록"];
+/* 이 실행이 이미 스크립트 잠금을 쥐고 있는지(잠금 안에서 또 잠그다 20초 멈추지 않게) */
+var LOCK_HELD_=false;
+/* 캐시 키는 250자 제한이 있어 해시로 */
+function key_(k){
+  return Utilities.base64EncodeWebSafe(Utilities.computeDigest(Utilities.DigestAlgorithm.MD5,k,Utilities.Charset.UTF_8));
+}
+function makeEnv_(){
+  var props=PropertiesService.getScriptProperties(),key=(PROPS_&&PROPS_.SECRET)||props.getProperty("SECRET");
+  if(!key){key=Utilities.getUuid()+Utilities.getUuid();props.setProperty("SECRET",key);}
+  return {
+    now:function(){return new Date();},
+    /* 마지막 백업 기록: 시트 칸은 사람이 고치거나 되돌릴 수 있어 스크립트 속성에도 둔다 */
+    lastBackup:function(){try{return props.getProperty("lastBackup")||"";}catch(e){return "";}},
+    /* 독서로 요청은 4분 30초까지만(Apps Script 한 번 실행은 6분이 한도) */
+    deadline:Date.now()+270000,
+    email:function(){return Session.getActiveUser().getEmail();},
+    mail:function(to,subject,body){MailApp.sendEmail({to:to,subject:subject,body:body,name:"서가"});},
+    appUrl:function(){try{return ScriptApp.getService().getUrl();}catch(e){return "";}},
+    mailQuota:function(){try{return MailApp.getRemainingDailyQuota();}catch(e){return -1;}},
+    cacheGet:function(k){return CacheService.getScriptCache().get(key_(k));},
+    cachePut:function(k,v,sec){CacheService.getScriptCache().put(key_(k),v,sec||600);},
+    /* 요청 묶음을 한 번에 보낸다. [{url,method,body}] → [{code,text}] */
+    http:function(reqs){
+      var rs=UrlFetchApp.fetchAll(reqs.map(function(q){
+        var o={url:q.url,method:q.method||"get",muteHttpExceptions:true,headers:{"Accept":"application/json"}};
+        /* 한글 검색어가 깨지지 않게 UTF-8 바이트로 보낸다 */
+        if(q.body){o.contentType="application/json; charset=utf-8";o.payload=Utilities.newBlob(JSON.stringify(q.body)).getBytes();}
+        return o;}));
+      return rs.map(function(r){return {code:r.getResponseCode(),text:r.getContentText("UTF-8")};});
+    },
+    uid:function(){return Utilities.getUuid().replace(/-/g,"").slice(0,10);},
+    hmac:function(s){
+      return Utilities.computeHmacSha256Signature(s,key).map(function(b){
+        return ("0"+((b+256)%256).toString(16)).slice(-2);}).join("");
+    }
+  };
+}
+
+/* 시트 한 장 = 표 하나. 한 번 읽은 표는 요청이 끝날 때까지 다시 읽지 않고,
+   요청 사이에는 CacheService 에 보관한다(시트마다 판 번호: 앱이 쓰거나 사람이 시트를 고치면 판이 올라가 다시 읽음) */
+var DB_CHUNK=25000;
+/* 사람이 손으로 고치는 탭은 짧게(시계가 놓쳐도 곧 따라오도록), 앱이 혼자 쓰는 큰 탭만 길게 */
+var TTL_HAND=["설정","교사","명단","공지","도서","권장도서","주제","이벤트","수령기간","건의","도장","글","문장"];
+/* 2026-10-13: 손 탭도 30분(예전 5분 — 5분만 조용하면 다음 사람이 시트를 열일곱 장 새로 읽어 7초 넘게 걸렸다).
+   사람이 시트를 고치면 onSheetEdit·onSheetChange 가 판을 올리므로 바로 따라오고, 1분 시계가 만료 전에 미리 새로 채운다(warm) */
+function dbTtl_(t){return TTL_HAND.indexOf(t)>=0?1800:21600;}
+function bumpSheet_(t){PropertiesService.getScriptProperties().setProperty("sv|"+t,String(Date.now())+String(Math.floor(Math.random()*1000)));}
+function makeDb_(){
+  var ssObj=null,cache={},PR=PropertiesService.getScriptProperties(),CS=null,ver=null,WT={};
+  function ssx(){return ssObj||(ssObj=ss_());}
+  function cs(){if(!CS)try{CS=CacheService.getScriptCache();}catch(e){CS=false;}return CS||null;}
+  function vers(){if(!ver){ver={};try{var all=PR.getProperties();PROPS_=all;Object.keys(all).forEach(function(k){if(k.indexOf("sv|")===0)ver[k.slice(3)]=all[k];});}catch(e){}}return ver;}
+  function ckey(t){return "db|"+key_(t)+"|"+(vers()[t]||"0");}
+  function fromCache(t){
+    var C=cs();if(!C)return null;
+    try{
+      var k=ckey(t),meta=C.get(k);if(!meta)return null;
+      var n=parseInt(meta,10),keys=[];for(var i=0;i<n;i++)keys.push(k+"|"+i);
+      var parts=C.getAll(keys),s="";
+      for(var j=0;j<n;j++){if(parts[keys[j]]==null)return null;s+=parts[keys[j]];}
+      var o=JSON.parse(s),h=o.h;
+      return {sh:null,head:h,rows:o.r.map(function(a){var r={_row:a[0]};for(var x=0;x<h.length;x++)r[h[x]]=a[x+1]==null?"":a[x+1];return r;})};
+    }catch(e){return null;}
+  }
+  function toCache(t,T,ttl){
+    var C=cs();if(!C)return;
+    try{
+      var s=JSON.stringify({h:T.head,r:T.rows.map(function(r){return [r._row].concat(T.head.map(function(h){return r[h];}));})});
+      var k=ckey(t),n=Math.max(1,Math.ceil(s.length/DB_CHUNK)),m={};
+      if(n>60)return;
+      m[k]=n+"|"+Date.now();for(var i=0;i<n;i++)m[k+"|"+i]=s.slice(i*DB_CHUNK,(i+1)*DB_CHUNK);   /* 머리 = 조각 수|넣은 시각(warm 이 만료 전에 새로 채우려고) */
+      C.putAll(m,ttl||dbTtl_(t));
+    }catch(e){}
+  }
+  /* 앱이 쓴 뒤: 판을 올리고 지금 내용을 새 판으로 보관 */
+  /* 쓴 뒤에는 판만 올린다. 내 기억 속 표를 캐시에 올리면, 내가 읽은 뒤 다른 실행이 바꾼 칸이
+     묵은 값으로 캐시에 박혀 다음 실행들이 그걸 믿게 된다(2026-09-25 점검). 다음에 읽는 쪽이 시트에서 새로 읽는다 */
+  /* 2026-10-13 반응 속도: 잠근 채 쓴 실행이고, 내가 읽은 뒤 아무도 판을 안 올렸다면(= 내 기억 속 표가 곧 시트) 요청 끝(flush)에 새 판으로 캐시에 올린다.
+     그러면 다음 사람이 시트를 새로 읽지 않는다. 잠그지 않은 쓰기(시계 작업 등)나 판이 엇갈리면 예전처럼 판만 올린다 */
+  function wrote(t){
+    try{
+      if(!(t in WT)){var ok=false;if(LOCK_HELD_&&cache[t]){try{ok=(PR.getProperty("sv|"+t)||"0")===(vers()[t]||"0");}catch(e){}}WT[t]=ok;}
+      var v=String(Date.now())+String(Math.floor(Math.random()*1000));PR.setProperty("sv|"+t,v);vers()[t]=v;
+    }catch(e){WT[t]=false;}
+  }
+  /* 시트에서 바로 새로 읽는다(캐시·기억 모두 건너뜀) */
+  function fresh(t){delete cache[t];var C0=cs();try{if(C0)C0.remove(ckey(t));}catch(e){}
+    var keep=vers()[t];vers()[t]="fresh"+Date.now();var T=load(t);vers()[t]=keep;return T;}
+  function sheetOf(t,T){if(!T.sh)T.sh=ssx().getSheetByName(t);return T.sh;}
+  function load(t,skip){
+    if(cache[t])return cache[t];
+    var hit=skip?null:fromCache(t);if(hit)return cache[t]=hit;
+    var ss=ssx(),sh=ss.getSheetByName(t);
+    /* 새 판에서 늘어난 시트는 그 자리에서 만든다(setup 을 다시 안 돌려도 앱이 멈추지 않게) */
+    if(!sh&&Core.HEAD[t]){
+      sh=ss.insertSheet(t);var h0=Core.HEAD[t];
+      sh.getRange(1,1,sh.getMaxRows(),h0.length).setNumberFormat("@");
+      sh.getRange(1,1,1,h0.length).setValues([h0]).setFontWeight("bold").setBackground("#F0E9D9");sh.setFrozenRows(1);
+    }
+    if(!sh)throw new Error("'"+t+"' 시트가 없습니다. Apps Script 편집기에서 setup 함수를 먼저 실행하세요.");
+    /* 줄이 모자라기 전에 미리 늘리고 글자 서식으로 맞춘다(서식이 없으면 "3-2"·날짜 글자가 날짜 값으로 바뀐다) */
+    if(sh.getMaxRows()-sh.getLastRow()<30){
+      var m0=sh.getMaxRows();sh.insertRowsAfter(m0,500);
+      sh.getRange(m0+1,1,500,Math.max(sh.getMaxColumns(),1)).setNumberFormat("@");
+    }
+    var v=sh.getDataRange().getValues(),head=v[0].map(String),rows=[];
+    /* 새 판에서 늘어난 열은 제목 줄 끝에 자동으로 붙인다(기존 시트를 그대로 쓰도록) */
+    var miss=(Core.HEAD[t]||[]).filter(function(h){return head.indexOf(h)<0;});
+    if(miss.length){
+      sh.getRange(1,head.length+1,sh.getMaxRows(),miss.length).setNumberFormat("@");
+      sh.getRange(1,head.length+1,1,miss.length).setValues([miss]).setFontWeight("bold").setBackground("#F0E9D9");
+      head=head.concat(miss);
+    }
+    for(var i=1;i<v.length;i++){
+      var o={_row:i+1},any=false;
+      for(var j=0;j<head.length;j++){o[head[j]]=cell_(v[i][j],head[j]);if(o[head[j]]!=="")any=true;}
+      if(any)rows.push(o);
+    }
+    cache[t]={sh:sh,head:head,rows:rows};
+    toCache(t,cache[t]);
+    return cache[t];
+  }
+  return {
+    rows:function(t){return load(t).rows;},
+    /* 요청 끝: 잠근 채 쓴 표를 새 판으로 캐시에(위 wrote 설명) */
+    flush:function(){
+      Object.keys(WT).forEach(function(t){
+        if(!WT[t]||!cache[t])return;
+        try{if((PR.getProperty("sv|"+t)||"0")===vers()[t])toCache(t,cache[t],Math.min(dbTtl_(t),1800));}catch(e){}
+      });
+      WT={};
+    },
+    /* 캐시 미리 채우기(1분 시계에서 4분마다): 없거나 수명의 60%가 지난 표는 시트에서 새로 읽어 올린다 → 사용자는 늘 캐시로 */
+    warm:function(list){
+      var C=cs();if(!C)return 0;var mk=list.map(ckey),metas=C.getAll(mk),n=0,now=Date.now();
+      list.forEach(function(t,i){
+        var m=String(metas[mk[i]]||""),at=Number(m.split("|")[1]||0);
+        if(m&&at&&now-at<dbTtl_(t)*600)return;
+        try{delete cache[t];load(t,true);n++;}catch(e){}
+      });
+      return n;
+    },
+    /* 여러 표를 캐시에서 한꺼번에(표마다 캐시를 두 번씩 부르면 17장에 1초 — 2026-10-13 실측) */
+    preload:function(list){
+      var C=cs();if(!C)return;
+      try{
+        var want=list.filter(function(t){return !cache[t];}),mk=want.map(ckey),metas=C.getAll(mk),keys=[],plan=[];
+        want.forEach(function(t,i){var n=parseInt(metas[mk[i]]||"0",10);if(!n)return;var ks=[];for(var j=0;j<n;j++)ks.push(mk[i]+"|"+j);plan.push([t,ks]);keys=keys.concat(ks);});
+        if(!keys.length)return;
+        var parts=C.getAll(keys);
+        plan.forEach(function(x){
+          var s="";for(var j=0;j<x[1].length;j++){var v=parts[x[1][j]];if(v==null)return;s+=v;}
+          try{var o=JSON.parse(s),h=o.h;
+            cache[x[0]]={sh:null,head:h,rows:o.r.map(function(a){var r={_row:a[0]};for(var q=0;q<h.length;q++)r[h[q]]=a[q+1]==null?"":a[q+1];return r;})};}catch(e){}
+        });
+      }catch(e){}
+    },
+    add:function(t,obj){
+      var T=load(t),sh=sheetOf(t,T);
+      if(sh.getMaxRows()-sh.getLastRow()<5){var m0=sh.getMaxRows();sh.insertRowsAfter(m0,500);sh.getRange(m0+1,1,500,Math.max(T.head.length,1)).setNumberFormat("@");}
+      sh.appendRow(T.head.map(function(h){return safe_(obj[h]);}));
+      var o={_row:sh.getLastRow()};T.head.forEach(function(h){o[h]=obj[h]==null?"":String(obj[h]);});
+      T.rows.push(o);wrote(t);
+    },
+    /* 여러 줄을 한 번에 붙인다(한 줄씩 appendRow 하면 수백 줄에 몇십 초) */
+    addMany:function(t,list){
+      if(!list.length)return;
+      var T=load(t),sh=sheetOf(t,T),start=sh.getLastRow()+1,vals=list.map(function(o){return T.head.map(function(h){return safe_(o[h]);});});
+      if(sh.getMaxRows()<start+vals.length){var m0=sh.getMaxRows();sh.insertRowsAfter(m0,vals.length+200);sh.getRange(m0+1,1,vals.length+200,T.head.length).setNumberFormat("@");}
+      sh.getRange(start,1,vals.length,T.head.length).setValues(vals);
+      list.forEach(function(o,i){var r={_row:start+i};T.head.forEach(function(h){r[h]=o[h]==null?"":String(o[h]);});T.rows.push(r);});
+      wrote(t);
+    },
+    /* 걸러 내기: 잠근 채 시트에서 새로 읽어 keep 에 맞는 줄만 남긴다.
+       replace 는 부른 쪽이 미리 만든 목록을 쓰므로, 그 사이 새로 붙은 줄(방금 로그인한 기기 등)을 지운다 */
+    prune:function(t,keep){
+      var n=0;this.rewrite(t,function(rows){var list=rows.filter(keep);n=rows.length-list.length;return n?list:null;});return n;
+    },
+    /* 통째로 다시 쓰기는 반드시 이 길로: 잠근 채 시트에서 새로 읽은 줄로 fn 을 돌리고, null 이면 그대로 둔다.
+       (묵은 사본으로 통째로 쓰면 그 사이 들어온 로그인·PIN·제출을 지운다) */
+    rewrite:function(t,fn){
+      /* 이미 잠근 채로 불렸으면(학생 등록 → 명단 정렬 등) 다시 잠그지 않는다 */
+      var mine=!LOCK_HELD_,L=mine?LockService.getScriptLock():null;
+      if(mine){L.waitLock(20000);LOCK_HELD_=true;}
+      try{
+        var T=fresh(t),out=fn(T.rows.slice());
+        if(out)this.replace(t,out);
+        return !!out;
+      }finally{if(mine){LOCK_HELD_=false;try{L.releaseLock();}catch(e){}}}
+    },
+    replace:function(t,list,locked){
+      var T=load(t),sh=sheetOf(t,T),last=sh.getLastRow();
+      if(last>=2)sh.getRange(2,1,last-1,Math.max(sh.getLastColumn(),T.head.length)).clearContent();
+      var vals=list.map(function(o){return T.head.map(function(h){return safe_(o[h]);});});
+      if(vals.length){
+        if(sh.getMaxRows()<vals.length+1)sh.insertRowsAfter(sh.getMaxRows(),vals.length+50);
+        sh.getRange(2,1,vals.length,T.head.length).setValues(vals);
+      }
+      T.rows=list.map(function(o,i){var r={_row:i+2};T.head.forEach(function(h){r[h]=o[h]==null?"":String(o[h]);});return r;});
+      wrote(t);
+    },
+    set:function(t,keyCol,keyVal,patch){
+      var T=load(t),any=false;
+      T.rows.forEach(function(r){
+        if(String(r[keyCol]).trim()!==String(keyVal))return;
+        Object.keys(patch).forEach(function(k){
+          var c=T.head.indexOf(k);if(c<0)return;
+          sheetOf(t,T).getRange(r._row,c+1).setValue(safe_(patch[k]));r[k]=String(patch[k]);any=true;
+        });
+      });
+      if(any)wrote(t);
+    },
+    /* 여러 줄의 몇 칸을 한꺼번에: 바뀌는 열마다 한 번씩만 쓴다. map = {키값:{열:값}} */
+    setMany:function(t,keyCol,map){
+      var T=load(t),cols={};
+      T.rows.forEach(function(r){
+        var p=map[String(r[keyCol]).trim()];if(!p)return;
+        Object.keys(p).forEach(function(k){if(T.head.indexOf(k)>=0){r[k]=p[k]==null?"":String(p[k]);cols[k]=true;}});
+      });
+      if(!Object.keys(cols).length)return;
+      var sh=sheetOf(t,T),last=sh.getLastRow();if(last<2)return;
+      Object.keys(cols).forEach(function(k){
+        var c=T.head.indexOf(k)+1,vals=[],byRow={};
+        T.rows.forEach(function(r){byRow[r._row]=r;});
+        var cur=sh.getRange(2,c,last-1,1).getValues();
+        /* 이번에 고치는 줄만 새 값, 나머지는 방금 시트에서 읽은 값 그대로(다른 실행이 바꾼 칸을 되돌리지 않게) */
+        for(var i=0;i<last-1;i++){var r=byRow[i+2],hit=r&&map[String(r[keyCol]).trim()]&&(k in map[String(r[keyCol]).trim()]);
+          vals.push([hit?safe_(r[k]):cur[i][0]]);}
+        sh.getRange(2,c,last-1,1).setValues(vals);
+      });
+      wrote(t);
+    },
+    setConf:function(k,v){
+      var T=load("설정"),sh=sheetOf("설정",T),hit=T.rows.filter(function(r){return String(r["항목"]).trim()===k;})[0];
+      /* 설정 값은 글자로 쓴다("2026-09" 를 시트가 날짜로 바꾸지 않게) */
+      if(hit){if(String(hit["값"])===String(v))return;sh.getRange(hit._row,2).setNumberFormat("@").setValue(String(v));hit["값"]=v;}
+      else{sh.appendRow([k,v]);sh.getRange(sh.getLastRow(),2).setNumberFormat("@").setValue(String(v));var o={_row:sh.getLastRow(),"항목":k,"값":v};T.head.forEach(function(h){if(o[h]==null)o[h]="";});T.rows.push(o);}
+      wrote("설정");
+    }
+  };
+}
+/* "3-2" 를 시트가 날짜로 바꿔 버린 경우까지 되돌린다 */
+function cell_(v,h){
+  if(v instanceof Date){
+    var f=(h==="반"||h==="담당")?"M-d":(h==="주"||h==="시작"||h==="끝")?"yyyy-MM-dd":h==="월"?"yyyy-MM":"yyyy-MM-dd HH:mm:ss";
+    return Utilities.formatDate(v,"Asia/Seoul",f);
+  }
+  return v==null?"":String(v);
+}
+/* 학생 글이 = 로 시작해도 수식으로 돌지 않게 */
+function safe_(v){
+  var s=v==null?"":String(v);
+  return /^[=+\-@]/.test(s)?" "+s:s;
+}
+
+function setup(){
+  var ss=ss_(),made=[];
+  Object.keys(Core.HEAD).forEach(function(t){
+    var sh=ss.getSheetByName(t);
+    if(!sh){sh=ss.insertSheet(t);made.push(t);}
+    var head=Core.HEAD[t];
+    if(sh.getLastRow()===0){
+      sh.getRange(1,1,sh.getMaxRows(),head.length).setNumberFormat("@");
+      sh.getRange(1,1,1,head.length).setValues([head]).setFontWeight("bold").setBackground("#F0E9D9");
+      sh.setFrozenRows(1);
+    }
+  });
+  var conf=ss.getSheetByName("설정");
+  if(conf.getLastRow()<2)conf.getRange(2,1,Core.CONF0.length,2).setValues(Core.CONF0);
+  /* 이미 있던 설정 시트에도 새 항목과 설명 칸을 채운다(아래 tick 의 maintain 이 한 번 더 확인) */
+  Core.make(makeDb_(),makeEnv_()).maintain();
+  conf.setColumnWidth(1,120);conf.setColumnWidth(2,200);conf.setColumnWidth(3,520);
+  var books=ss.getSheetByName("도서");
+  if(false){   /* 예전 '상시 추천 도서' 목록은 더 이상 깔지 않는다(서가는 이번 달 추천 도서만) */
+    var rows=Core.seedBooks().map(function(b){return Core.HEAD["도서"].map(function(h){return b[h];});});
+    books.getRange(2,1,rows.length,rows[0].length).setValues(rows);
+  }
+  var qs=ss.getSheetByName("문장");
+  if(qs.getLastRow()<2){
+    var qrows=Core.seedQuotes().map(function(q){return Core.HEAD["문장"].map(function(h){return q[h];});});
+    qs.getRange(2,1,qrows.length,qrows[0].length).setValues(qrows);
+    qs.setColumnWidth(1,560);qs.setColumnWidth(2,260);
+  }
+  var tch=ss.getSheetByName("교사"),msg="";
+  if(tch.getLastRow()<2){
+    var me=Session.getEffectiveUser().getEmail();
+    tch.getRange(2,1,1,3).setValues([[me,"담당교사","전체"]]);
+    msg="\n\n교사 시트에 "+me+" 를 담당 교사(전체 권한)로 넣었습니다. 이름은 시트에서 바꾸세요.\n담임은 이메일·이름·담당(3-2 형식)을 한 줄씩 추가합니다.";
+    var dom=me.split("@")[1];
+    if(dom&&dom!=="gmail.com"){
+      var rows=conf.getDataRange().getValues();
+      for(var r=1;r<rows.length;r++)if(rows[r][0]==="허용도메인"&&!rows[r][1])conf.getRange(r+1,2).setValue("@"+dom);
+    }
+  }
+  makeEnv_();
+  var trig=installTrigger_();
+  /* 독서로 일(추천 도서 뽑기·대출 확인)은 시간이 걸려 setup 에서 기다리지 않고 30초 뒤 따로 돌린다 */
+  ScriptApp.getProjectTriggers().forEach(function(t){if(t.getHandlerFunction()==="firstRun")ScriptApp.deleteTrigger(t);});
+  ScriptApp.newTrigger("firstRun").timeBased().after(30*1000).create();
+  var lib="\n독서로 확인과 이번 달 추천 도서 뽑기는 30초 뒤 따로 시작해 1~3분 걸립니다. 끝나면 '설정' 탭 '도서확인' 칸에 시각이 찍힙니다(Apps Script 왼쪽 '실행' 메뉴에서 firstRun 기록도 볼 수 있음).";
+  say_("설정을 마쳤습니다."+lib+(trig?"\n매일 7시·15시·0시에 독서로 소장·대출을 확인하고, 매달 1일에 이번 달 추천 도서를 새로 뽑습니다.":"")+(made.length?"\n만든 시트: "+made.join(", "):"")+msg+
+    "\n\n다음: 명단 시트에 학번·이름·반(3-2 형식)을 붙여넣고(이메일 칸은 비워 두면 학생이 처음 들어올 때 스스로 등록), "+
+    "[배포 > 새 배포 > 웹 앱]에서 실행: 나 / 액세스: 학교 도메인 내 모든 사용자 로 배포하세요.");
+}
+
+/* 하루 세 번(7시·15시·0시) 도는 일(setup 이 시계를 걸어 둔다).
+   달이 바뀌었으면 이번 달 추천 도서를 새로 뽑고, 서가 책의 소장·대출 상태를 새로 받는다 */
+/* setup 이 30초 뒤로 걸어 둔 첫 독서로 작업(한 번 돌고 자기 시계는 지운다) */
+function firstRun(){
+  ScriptApp.getProjectTriggers().forEach(function(t){if(t.getHandlerFunction()==="firstRun")ScriptApp.deleteTrigger(t);});
+  /* setup 을 따로 돌리지 않아도 되게: 하루 세 번 시계를 확인하고, 새 설정·시트를 채운 뒤 독서로 확인 */
+  try{installTrigger_();}catch(e){console.log("시계: "+e.message);}
+  try{applySheetUi_();}catch(e){console.log("시트 모양: "+e.message);}
+  try{Core.make(makeDb_(),makeEnv_()).maintain();}catch(e){console.log("정리: "+e.message);}
+  /* 시트 갈이가 끝난 시점에 새 판으로 적는다. 독서로 확인(20~40초)은 그 뒤에 이어서 */
+  PropertiesService.getScriptProperties().setProperty("codeVer",CODE_VERSION);
+  libDaily();
+}
+/* 매월 1일 7시 이후 첫 확인 때 한 번: 지난달 상품권 대상 명단을 담당·담임 선생님께 메일로 */
+/* 수령 기간 첫날 7시 이후 첫 확인 때 한 번: 대상 명단을 관리자·학년 담당 선생님께 */
+function giftMailIfDue_(){
+  var hour=Number(new Date(Date.now()+9*3600000).toISOString().slice(11,13));
+  if(hour<7)return 0;
+  var core=Core.make(makeDb_(),makeEnv_()),key=core.giftMailKey();if(!key)return 0;
+  var props=PropertiesService.getScriptProperties();
+  if(props.getProperty("giftMailed")===key)return 0;
+  var n=sendGiftMail_();
+  props.setProperty("giftMailed",key);
+  return n;
+}
+function sendGiftMail_(){
+  var list=Core.make(makeDb_(),makeEnv_()).giftMail(),n=0;
+  list.forEach(function(m){try{MailApp.sendEmail(m.to,m.subject,m.body);n++;}catch(e){console.log("메일 실패 "+m.to+": "+e.message);}});
+  return n;
+}
+function giftMailNow(){say_("오늘 시작하는 수령 기간 상품권 메일을 "+sendGiftMail_()+"통 보냈습니다.");}
+/* 설정 시트의 학교 코드·교육청 코드·학교명 */
+function libConf_(){var o={neis:"",prov:"",school:""};try{makeDb_().rows("설정").forEach(function(r){var k=String(r["항목"]).trim(),v=String(r["값"]).trim();if(k==="학교코드")o.neis=v;if(k==="교육청코드")o.prov=v;if(k==="학교명")o.school=v;});}catch(e){}return o;}
+/* 독서로가 구글 서버에서 되는지 직접 확인한다. 편집기에서 libTest 를 골라 실행하고 아래 '실행 로그'를 보세요 */
+function libTest(){
+  var core=Core.make(makeDb_(),makeEnv_()),p=core.libProbe();
+  console.log("① 분류 조회: "+(p.ok?"정상 — 소설 "+p.count+"권":"실패 — "+p.why));
+  var rs=makeEnv_().http([{url:"https://read365.edunet.net/alpasq/api/search",method:"post",
+    body:{searchKeyword:"아몬드",page:1,display:5,neisCode:[libConf_().neis],provCode:libConf_().prov,schoolName:libConf_().school,coverYn:"N"}}]);
+  console.log("② 제목 조회(아몬드): 코드 "+rs[0].code+" · "+rs[0].text.slice(0,200));
+  say_(p.ok?"독서로 연결 정상":"독서로 연결 실패: "+p.why);
+}
+/* 달마다 한 번(그달 마지막 날) 시트 사본을 드라이브 '서가 백업' 폴더에 남긴다 */
+/* 백업: 설정 '백업주기'가 '주'면 한 주에 한 번(그 주 첫 확인 때), '월'이면 그달 마지막 날 */
+function backupMonthly_(force){
+  var db=makeDb_(),conf={};
+  db.rows("설정").forEach(function(r){conf[String(r["항목"]).trim()]=String(r["값"]);});
+  var now=new Date(),tz="Asia/Seoul";
+  var mon=Utilities.formatDate(now,tz,"yyyy-MM");
+  var last=Utilities.formatDate(new Date(now.getFullYear(),now.getMonth()+1,0),tz,"yyyy-MM-dd");
+  var today=Utilities.formatDate(now,tz,"yyyy-MM-dd");
+  var cyc=String(conf["백업주기"]||"주")==="월"?"월":"주";
+  /* 그 주 월요일 */
+  var k9=new Date(now.getTime()+9*3600000),dow=(k9.getUTCDay()+6)%7;
+  var wk=Utilities.formatDate(new Date(now.getTime()-dow*86400000),tz,"yyyy-MM-dd");
+  var key=cyc==="주"?wk:mon;
+  if(!force){
+    if(cyc==="월"&&today!==last)return "";          /* 달마다면 그달 마지막 날에만 */
+    if(String(conf["백업월"]||"")===key)return "";   /* 이번 주(달)에 이미 했으면 그만 */
+  }
+  var ss=ss_(),name=(conf["프로그램명"]||"서가")+" 백업 "+(force?Utilities.formatDate(now,tz,"yyyy-MM-dd HHmm"):key);
+  /* ① 드라이브 권한이 있으면 '서가 백업' 폴더 안에 사본을 둔다.
+     ② 권한이 아직이면 스프레드시트 기능만으로 사본을 만든다(내 드라이브 맨 위에 생김).
+        둘 다 같은 사본이고, 권한을 한 번 승인하면 그때부터 폴더로 들어간다. */
+  var url="",where="",folder=null;
+  try{folder=backupFolder_(conf["백업폴더"]);}catch(e0){BACKUP_ERR="폴더: "+e0.message;}
+  /* ① 폴더 안에 구글 시트 사본 그대로(드라이브 전체 권한이 있을 때) */
+  if(folder)try{
+    var copy=DriveApp.getFileById(ss.getId()).makeCopy(name,folder);
+    url=copy.getUrl();where=folder.getName()+" 폴더";
+    try{tidyBackups_(folder,ss.getId(),conf["백업보관"]);}catch(e2){console.log("사본 모으기: "+e2.message);}
+  }catch(e){BACKUP_ERR=String(e&&e.message||e).slice(0,200);}
+  /* ② 사본을 못 만들면 엑셀 파일로 내려받아 폴더에 넣는다(읽기 권한만 있어도 됨) */
+  if(!url&&folder)try{
+    var f2=backupExport_(folder,name);
+    url=f2.getUrl();where=folder.getName()+" 폴더(엑셀)";
+  }catch(e3){BACKUP_ERR=(BACKUP_ERR?BACKUP_ERR+" / ":"")+"엑셀: "+String(e3&&e3.message||e3).slice(0,120);}
+  /* ③ 그래도 안 되면 내 드라이브에 시트 사본 */
+  if(!url){
+    var cp=SpreadsheetApp.openById(ss.getId()).copy(name);
+    url=cp.getUrl();where="내 드라이브(폴더에 못 넣음)";
+  }
+  db.setConf("백업월",key);
+  var rec=Utilities.formatDate(now,tz,"yyyy-MM-dd HH:mm")+" · "+name+" · "+where+" · "+url+
+    (where.indexOf("폴더에 못")>=0?" · 드라이브 ‘모든 파일 보기·수정’ 권한을 허용하면 백업폴더로 들어갑니다":"");
+  try{PropertiesService.getScriptProperties().setProperty("lastBackup",rec);}catch(e){}
+  db.setConf("백업",rec);
+  return name;
+}
+var BACKUP_ERR="";
+/* 시트를 엑셀로 내려받아 폴더에 넣는다(makeCopy 권한이 없을 때 쓰는 길) */
+function backupExport_(folder,name){
+  var id=ss_().getId();
+  var url="https://www.googleapis.com/drive/v3/files/"+id+"/export?mimeType="+
+    encodeURIComponent("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  var res=UrlFetchApp.fetch(url,{headers:{Authorization:"Bearer "+ScriptApp.getOAuthToken()},muteHttpExceptions:true});
+  if(res.getResponseCode()!==200)throw new Error("내보내기 "+res.getResponseCode());
+  return folder.createFile(res.getBlob().setName(name+".xlsx"));
+}
+/* 백업을 넣을 폴더: 설정 '백업폴더'(드라이브 주소나 ID) → 이름으로 찾기 → 새로 만들기 */
+function backupFolder_(want){
+  var id=String(want||"").trim();
+  var m=/[-\w]{25,}/.exec(id);       /* 드라이브 주소에서 폴더 ID만 뽑는다 */
+  if(m){try{return DriveApp.getFolderById(m[0]);}catch(e){console.log("백업폴더 ID 로 열지 못했습니다: "+e.message);}}
+  var it=DriveApp.getFoldersByName("서가 백업");
+  return it.hasNext()?it.next():DriveApp.createFolder("서가 백업");
+}
+/* 권한이 없던 동안 내 드라이브에 흩어져 만들어진 사본을 폴더로 모으고, 오래된 것은 정리한다 */
+function tidyBackups_(folder,selfId,keep){
+  var moved=0,names=[];
+  var it=DriveApp.searchFiles('title contains "백업" and trashed = false');
+  while(it.hasNext()&&moved<50){
+    var f=it.next();
+    if(f.getId()===selfId)continue;
+    if(f.getName().indexOf("백업")<0)continue;
+    var inFolder=false,ps=f.getParents();
+    while(ps.hasNext()){if(ps.next().getId()===folder.getId()){inFolder=true;break;}}
+    if(inFolder)continue;
+    try{f.moveTo(folder);moved++;names.push(f.getName());}catch(e){}
+  }
+  if(moved)console.log("백업 사본 "+moved+"개를 폴더로 옮겼습니다: "+names.join(", "));
+  /* 정한 개수가 넘으면 오래된 것부터 버린다(휴지통으로 — 30일 안에는 되살릴 수 있다) */
+  var n=Number(keep)>0?Number(keep):12;
+  var all=[],fi=folder.getFiles();
+  while(fi.hasNext())all.push(fi.next());
+  all.sort(function(x,y){return x.getDateCreated()<y.getDateCreated()?1:-1;});
+  var gone=0;
+  all.slice(n).forEach(function(f){try{f.setTrashed(true);gone++;}catch(e){}});
+  if(gone)console.log("오래된 백업 "+gone+"개를 휴지통으로 보냈습니다(남긴 것 "+Math.min(n,all.length)+"개).");
+  return moved;
+}
+/* 백업 폴더 주소(없으면 만든다) */
+function backupFolderUrl_(){
+  try{
+    var db=makeDb_(),want="";
+    db.rows("설정").forEach(function(r){if(String(r["항목"]).trim()==="백업폴더")want=String(r["값"]);});
+    return backupFolder_(want).getUrl();
+  }catch(e){return "";}
+}
+/* 메뉴·편집기에서 바로 눌러 만드는 백업(권한 확인도 이때 함께 물어봅니다) */
+function backupNow(){
+  var n=backupMonthly_(true);
+  say_(n?("사본을 만들었습니다: "+n+" · 드라이브 ‘서가 백업’ 폴더"):"백업을 만들지 못했습니다.");
+}
+function libDaily(){
+  try{var bk=backupMonthly_();if(bk)say_("달마다 백업: 드라이브 ‘서가 백업’ 폴더에 "+bk+" 을(를) 만들었습니다.");}catch(e){console.log("백업: "+e.message);}
+  var sent=0;try{sent=giftMailIfDue_();}catch(e){console.log("상품권 메일: "+e.message);}
+  if(sent)console.log("지난달 상품권 메일 "+sent+"통을 보냈습니다.");
+  var r;
+  try{r=job_(function(){return Core.make(makeDb_(),makeEnv_()).tick();});}
+  catch(e){console.log("건너뜀: "+e.message);return;}
+  try{makeDb_().warm(PRELOAD_);}catch(e){}   /* 독서로 확인이 바꾼 표를 곧바로 캐시에(다음 학생이 시트를 새로 읽지 않게) */
+  if(r.down){say_("독서로 확인을 건너뛰었습니다: "+r.why+" (북퀴즈 채우기는 했습니다). 다음 정해진 시각에 다시 시도합니다.");return;}
+  var msg="독서로 확인: "+r.lib.checked+"권 중 "+r.lib.found+"권 소장"+(r.lib.failed?", 조회 실패 "+r.lib.failed+"권":"");
+  if(r.rotate&&!r.rotate.skipped)msg+="\n"+r.rotate.month+" 이번 달 추천 도서 "+(r.rotate.picked||0)+"권을 새로 뽑았습니다.";
+  if(r.quiz&&r.quiz.added)msg+="\n이번 주 북퀴즈 "+r.quiz.added+"문제를 채웠습니다(학생 문제 "+r.quiz.student+", 자동 "+r.quiz.auto+").";
+  say_(msg);
+}
+function quizNow(){
+  var r=job_(function(){return Core.make(makeDb_(),makeEnv_()).ensureWeeklyQuiz();});
+  say_(r.added?"이번 주 북퀴즈 "+r.added+"문제를 채웠습니다(학생 문제 "+r.student+", 자동 "+r.auto+").":"이번 주 북퀴즈는 이미 다 찼습니다.");
+}
+function rotateNow(){
+  var r=job_(function(){return Core.make(makeDb_(),makeEnv_()).rotateMonth(true);});
+  say_(r.picked?"이번 달 추천 도서 "+r.picked+"권을 새로 뽑았습니다.":"새로 뽑지 못했습니다. 독서로 응답을 확인해 주세요.");
+}
+var HOURS_=[7,15,0];
+/* 사람이 시트를 고치면 그 표의 판을 올리고 곧바로 다시 읽어 캐시에(다음 사람이 기다리지 않게) */
+function onSheetEdit(e){try{var nm=e.range.getSheet().getName();bumpSheet_(nm);if(nm!=="수령대상")markRecvDirty_();if(PRELOAD_.indexOf(nm)>=0)try{makeDb_().warm([nm]);}catch(x){}}catch(x){}}
+/* ── 구글 시트 '수령대상'을 실시간으로(2026-10-09 회장님 지시) ──
+   쓰기 요청·시트 고침이 있으면 표시만 남기고, 1분마다 도는 시계가 표시가 있을 때만 다시 쓴다(없으면 바로 끝) */
+var RECV_QUIET_=["seen","clientError","like","newsSeen","ideaAdd","ideaReply","login","pinChange","consent","recvSync","authorFind","findHome","libSearch","staffLabel","vote"];
+function markRecvDirty_(){try{PropertiesService.getScriptProperties().setProperty("recvDirty",String(Date.now()));}catch(e){}}
+function recvMinute(){
+  var P=PropertiesService.getScriptProperties();
+  /* 4분마다 캐시를 미리 채운다(아무도 안 들어온 뒤 첫 사람이 시트를 새로 읽지 않게) */
+  try{if(Date.now()-(Number(P.getProperty("warmAt"))||0)>=4*60*1000-5000){P.setProperty("warmAt",String(Date.now()));var nw=makeDb_().warm(PRELOAD_);if(nw)P.setProperty("warmLast",new Date().toISOString()+" "+nw);}}catch(e){console.log("캐시 채우기: "+e.message);}
+  if(!P.getProperty("recvDirty"))return 0;
+  /* 금요일 점심 12시~2시는 1분마다, 나머지는 바뀐 것이 있어도 10분에 한 번(2026-10-12 회장님: 점심시간에 다 배부) */
+  var hm=Utilities.formatDate(new Date(),"Asia/Seoul","u HH:mm"),busy=hm.charAt(0)==="5"&&hm.slice(2)>="12:00"&&hm.slice(2)<"14:00";
+  if(!busy&&Date.now()-(Number(P.getProperty("recvLast"))||0)<10*60*1000)return 0;
+  var lk=LockService.getScriptLock();if(!lk.tryLock(15000))return 0;
+  try{
+    LOCK_HELD_=true;
+    P.deleteProperty("recvDirty");P.setProperty("recvLast",String(Date.now()));   /* 지우고 나서 쓴다 — 그 사이 또 바뀌면 다음 차례에 다시 */
+    var n=Core.make(makeDb_(),makeEnv_()).syncRecvSheet();
+    P.setProperty("recvAt",Utilities.formatDate(new Date(),"Asia/Seoul","yyyy-MM-dd HH:mm:ss")+" · "+n+"줄");
+    return n;
+  }catch(e){P.setProperty("recvDirty",String(Date.now()));console.log("수령대상: "+e.message);return 0;}
+  finally{LOCK_HELD_=false;try{lk.releaseLock();}catch(e){}}
+}
+/* 줄·열·탭을 넣거나 지우는 등 모양이 바뀐 때만 모든 표의 판을 올린다. 칸 고침(EDIT)은 onSheetEdit 가 그 표만, 서식(FORMAT)은 값이 안 바뀜
+   (예전엔 칸 하나만 고쳐도 표 25장 판을 다 올려 다음 사람이 10초 기다렸다 — 2026-10-13) */
+function onSheetChange(e){try{if(e&&(e.changeType==="EDIT"||e.changeType==="FORMAT"))return;Object.keys(Core.HEAD).forEach(bumpSheet_);try{makeDb_().warm(PRELOAD_);}catch(x){}}catch(x){}}
+function installEditTriggers_(){
+  var have={};ScriptApp.getProjectTriggers().forEach(function(t){have[t.getHandlerFunction()]=true;});
+  if(!have.onSheetEdit)ScriptApp.newTrigger("onSheetEdit").forSpreadsheet(SHEET_ID).onEdit().create();
+  if(!have.onSheetChange)ScriptApp.newTrigger("onSheetChange").forSpreadsheet(SHEET_ID).onChange().create();
+  if(!have.onOpen)ScriptApp.newTrigger("onOpen").forSpreadsheet(SHEET_ID).onOpen().create();
+}
+/* 시트 모양 정리: 교사 '담당' 칸 드롭다운(관리자·1학년·2학년·3학년·교사), 명단 '도서부' 칸 드롭다운(Y).
+   예전 값 '전체'는 '관리자'로, '3-2' 같은 반은 '3학년'으로 바꿔 둔다 */
+/* 시트 정리: 선생님이 볼 탭만 앞에 차례대로, 앱이 혼자 쓰는 탭은 숨김 */
+var SHEET_ORDER=["시작","안내","설정","명단","교사","도서","권장도서","주제","이벤트","글","도장","퀴즈","수령기간","수령대상","지급","배부기록","화면오류","안내확인","공지","건의","문장","장서목록","작가"];
+/* 더 이상 쓰지 않는 탭(옛 메일 인증, 문장을 따로 두던 채집)은 숨겨만 둔다 — 지우지는 않는다 */
+var SHEET_HIDE=["기기","반응","퀴즈응답"];
+/* 판이 바뀌며 더 쓰지 않게 된 탭: 줄이 거의 없으면 지우고, 자료가 있으면 숨기기만 한다 */
+var SHEET_DEAD=["인증","채집","공감","투표"];
+function tidySheets_(){
+  var ss=ss_();
+  SHEET_ORDER.forEach(function(n,i){
+    var sh=ss.getSheetByName(n);if(!sh)return;
+    try{ss.setActiveSheet(sh);ss.moveActiveSheet(i+1);}catch(x){}
+    try{if(sh.isSheetHidden())sh.showSheet();}catch(x){}
+  });
+  SHEET_HIDE.forEach(function(n){
+    var sh=ss.getSheetByName(n);if(!sh)return;
+    try{if(!sh.isSheetHidden())sh.hideSheet();}catch(x){}
+  });
+  SHEET_DEAD.forEach(function(n){
+    var sh=ss.getSheetByName(n);if(!sh)return;
+    try{
+      if(sh.getLastRow()<=2&&ss.getSheets().length>1){ss.deleteSheet(sh);console.log("안 쓰는 탭 정리: "+n);}
+      else if(!sh.isSheetHidden())sh.hideSheet();
+    }catch(x){}
+  });
+  try{ss.setActiveSheet(ss.getSheetByName("시작")||ss.getSheetByName("설정")||ss.getSheets()[0]);}catch(x){}
+}
+/* 시트 쓰는 법을 '안내' 탭과 머리줄 메모에 적어 둔다(판이 바뀌면 다시 씀) */
+function writeSheetDoc_(force){
+  var ss=ss_(),D=Core.SHEET_DOC||{},order=SHEET_ORDER.concat(Object.keys(D)).filter(function(v,i,a){return a.indexOf(v)===i&&D[v];});
+  /* 설명이 그대로고 안내 탭도 멀쩡하면 다시 쓰지 않는다(판만 올린 배포에서 20초 넘게 걸리던 일) */
+  var props=PropertiesService.getScriptProperties(),key="";
+  try{
+    key=Utilities.computeDigest(Utilities.DigestAlgorithm.MD5,JSON.stringify(D)+"|"+order.join(","),Utilities.Charset.UTF_8)
+      .map(function(b){return ("0"+((b+256)%256).toString(16)).slice(-2);}).join("");
+    var old=ss.getSheetByName("안내");
+    if(!force&&key&&props.getProperty("docHash")===key&&old&&old.getLastRow()>5)return 0;
+  }catch(e){}
+  /* ① 머리줄 메모: 칸 이름 위에 마우스를 올리면 뜻과 예시가 보인다 */
+  order.forEach(function(name){
+    var sh=ss.getSheetByName(name);if(!sh||sh.getLastColumn()<1)return;
+    var head=sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0].map(String);
+    var notes=head.map(function(h){
+      var c=D[name].c[h];
+      return c?(h+"\n"+c[0]+(c[1]?"\n예) "+c[1]:"")):"";
+    });
+    try{sh.getRange(1,1,1,head.length).setNotes([notes]);}catch(e){}
+  });
+  /* ② 안내 탭: 표 하나로 모아 보기 */
+  var sh=ss.getSheetByName("안내")||ss.insertSheet("안내",0);
+  sh.clear();
+  var rows=[["탭","무엇을 담는 곳","칸","뜻","예시"]];
+  order.forEach(function(name){
+    var d=D[name],cols=Core.HEAD[name]||Object.keys(d.c);
+    rows.push([name,d.d+" ("+d.edit+")","","",""]);
+    cols.forEach(function(h){
+      var c=d.c[h];if(!c)return;
+      rows.push(["",""," "+h,c[0],c[1]||""]);
+    });
+  });
+  sh.getRange(1,1,rows.length,5).setValues(rows);
+  sh.getRange(1,1,1,5).setFontWeight("bold").setBackground("#F0E9D9");
+  sh.setFrozenRows(1);
+  sh.setColumnWidth(1,90);sh.setColumnWidth(2,420);sh.setColumnWidth(3,120);sh.setColumnWidth(4,420);sh.setColumnWidth(5,260);
+  /* 탭 이름 줄은 굵게 */
+  for(var i=2;i<=rows.length;i++){
+    if(rows[i-1][0]){
+      sh.getRange(i,1,1,5).setFontWeight("bold").setBackground("#FBF6EA");
+    }
+  }
+  sh.getRange(1,1,rows.length,5).setVerticalAlignment("top").setWrap(true);
+  try{if(key)props.setProperty("docHash",key);}catch(e){}
+  return rows.length;
+}
+/* 시트에서 고친 내용을 앱이 바로 읽게 한다(시계가 놓쳤을 때를 위한 손잡이) */
+function refreshNow(){
+  Object.keys(Core.HEAD).forEach(bumpSheet_);
+  try{Core.make(makeDb_(),makeEnv_()).maintain();}catch(e){console.log("정리: "+e.message);}
+  say_("시트에서 고친 내용을 앱에 반영했습니다. 화면을 새로 고치면 바로 보입니다.");
+}
+function sheetDocNow(){var n=writeSheetDoc_(true);writeStartTab_();say_("‘안내’ 탭에 시트 쓰는 법 "+n+"줄을 적었습니다. ‘시작’ 탭에는 들어가는 주소를 적었습니다.");}
+/* 웹앱 주소. 배포한 주소(/exec)를 그대로 돌려준다 */
+function appUrl_(){try{return ScriptApp.getService().getUrl()||"";}catch(e){return "";}}
+/* ‘시작’ 탭: 이 시트를 연 선생님이 가장 먼저 볼 것 — 학생·선생님이 들어가는 주소 */
+function writeStartTab_(){
+  var ss=ss_(),url=appUrl_(),demo="https://wmfsljy-coder.github.io/seoga-template/";
+  var sh=ss.getSheetByName("시작");
+  if(!sh){sh=ss.insertSheet("시작",0);}else{try{ss.setActiveSheet(sh);ss.moveActiveSheet(1);}catch(e){}}
+  sh.clear();
+  try{sh.clearConditionalFormatRules();}catch(e){}
+  var name=(function(){try{var r=ss.getSheetByName("설정").getDataRange().getValues().filter(function(x){return String(x[0])==="프로그램명";})[0];return r?String(r[1]):"서가";}catch(e){return "서가";}})();
+  var rows=[
+    [name+" — 들어가는 주소",""],
+    ["",""],
+    ["학생·선생님 모두 이 주소",url||"(아직 웹앱으로 배포하지 않았습니다. 확장 프로그램 → Apps Script → 배포 → 새 배포 → 웹 앱)"],
+    ["처음 들어갈 때","학생은 학번·이름, 선생님은 이름을 넣고 PIN 여섯 자리를 정합니다. 그 뒤로는 학번(이름)과 PIN 으로 들어갑니다."],
+    ["휴대폰으로 알려 줄 때","위 주소를 복사해 학급 알림장에 올리거나, 아래 ‘교실 게시용 안내문’을 뽑아 교실에 붙이세요."],
+    ["교실 게시용 안내문(QR)","앱에 관리자로 들어가 시상·인쇄 탭 → ‘교실 게시용 안내문’을 A4 로 인쇄하면 QR 이 함께 나옵니다."],
+    ["관리자·담임 화면","같은 주소로 들어가면 교사 시트에 이름이 있는 선생님에게는 교사 화면이 보입니다."],
+    ["둘러보기(가짜 자료)",demo],
+    ["",""],
+    ["이 시트는","학생 이름·학번이 들어 있습니다. 학생에게 공유하지 마세요. 공유는 위 주소(웹앱)로만 하세요."],
+    ["판 표시",CODE_VERSION]
+  ];
+  sh.getRange(1,1,rows.length,2).setValues(rows);
+  sh.getRange(1,1,1,2).merge().setFontSize(16).setFontWeight("bold").setBackground("#F0E9D9");
+  sh.getRange(3,1,rows.length-2,1).setFontWeight("bold");
+  sh.getRange(1,1,rows.length,2).setVerticalAlignment("top").setWrap(true);
+  sh.setColumnWidth(1,190);sh.setColumnWidth(2,620);
+  if(url)sh.getRange(3,2).setFormula('=HYPERLINK("'+url+'";"'+url+'")').setFontSize(12);
+  sh.getRange(8,2).setFormula('=HYPERLINK("'+demo+'";"'+demo+'")');
+  sh.getRange(3,1,1,2).setBackground("#FBF6EA");
+  try{sh.setFrozenRows(1);sh.getRange(1,3,1,1).activate();}catch(e){}
+  return url;
+}
+function appUrlShow(){
+  var url=writeStartTab_();
+  say_(url?("들어가는 주소를 ‘시작’ 탭에 적었습니다.\n\n"+url):"아직 웹앱으로 배포하지 않았습니다. 확장 프로그램 → Apps Script → 배포 → 새 배포 → 웹 앱 으로 배포한 뒤 다시 눌러 주세요.");
+}
+function applySheetUi_(){
+  try{writeSheetDoc_();}catch(x){console.log("안내 탭: "+x.message);}
+  try{writeStartTab_();}catch(x){console.log("시작 탭: "+x.message);}
+  try{tidySheets_();}catch(x){}
+  var ss=ss_(),t=ss.getSheetByName("교사");
+  if(t&&t.getLastRow()>=1){
+    var h=t.getRange(1,1,1,t.getLastColumn()).getValues()[0].map(String),c=h.indexOf("담당")+1;
+    if(c>0){
+      var n=Math.max(t.getMaxRows()-1,1),rg=t.getRange(2,c,n,1);
+      rg.setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(["관리자","1학년","2학년","3학년","교사"],true).setAllowInvalid(false)
+        .setHelpText("관리자 = 모든 권한(사서) / n학년 = 그 학년 담당(담임) / 교사 = 추천 도서·선생님 라벨").build());
+      if(t.getLastRow()>=2){
+        var r2=t.getRange(2,c,t.getLastRow()-1,1),v=r2.getValues(),ch=false;
+        v.forEach(function(x){var s=String(x[0]).trim(),m;if(s==="전체"){x[0]="관리자";ch=true;}else if((m=/^(\d)(-\d+)?$/.exec(s))){x[0]=m[1]+"학년";ch=true;}});
+        if(ch){r2.setValues(v);bumpSheet_("교사");}
+      }
+    }
+  }
+  var rv=ss.getSheetByName("수령기간");
+  if(rv){
+    var nr=Math.max(rv.getMaxRows()-1,1);
+    rv.getRange(2,1,nr,2).setNumberFormat("yyyy-mm-dd").setDataValidation(SpreadsheetApp.newDataValidation().requireDate().setAllowInvalid(false)
+      .setHelpText("날짜를 고르세요(두 번 누르면 달력). 이 기간 시작 전까지 모은 별로 상품권을 받고, 기간이 끝나면 안 받은 별은 사라집니다.").build());
+    rv.setColumnWidth(1,110);rv.setColumnWidth(2,110);rv.setColumnWidth(3,240);
+  }
+  var rt=ss.getSheetByName("수령대상");
+  if(rt){rt.getRange(1,1).setNote("앱이 자동으로 채우는 보기용 표입니다(하루 세 번, 배부 완료를 누를 때마다). 손으로 고쳐도 다음 정리 때 덮어씁니다. 배부 표시는 앱의 ‘배부 확인’·‘상품권’ 탭에서.");}
+  var s=ss.getSheetByName("명단");
+  if(s&&s.getLastRow()>=1){
+    var hs=s.getRange(1,1,1,s.getLastColumn()).getValues()[0].map(String),cs=hs.indexOf("도서부")+1;
+    if(cs>0)s.getRange(2,cs,Math.max(s.getMaxRows()-1,1),1).setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(["Y"],true).setAllowInvalid(true).build());
+  }
+}
+/* 명단 한 번 넣기: tools 에서 비밀 열쇠로 보낸다(열쇠 해시만 코드에 있고, 한 번 쓰면 끝) */
+var IMPORT_KEY_HASH="";
+var TEST_KEY_HASH="86b6d2c71c238bcd50e184593afe99e94cbf7135e38fdea3958e8c62cdf55079";
+function doPost(e){
+  var out={};
+  try{
+    var p=JSON.parse(e.postData.contents),props=PropertiesService.getScriptProperties();
+    var h=Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256,String(p.key||""),Utilities.Charset.UTF_8).map(function(b){return ("0"+((b+256)%256).toString(16)).slice(-2);}).join("");
+    if(!IMPORT_KEY_HASH||h!==IMPORT_KEY_HASH||props.getProperty("importUsed|"+h))throw new Error("열쇠가 맞지 않습니다.");
+    var lock=LockService.getScriptLock();lock.waitLock(30000);
+    try{
+      var db=makeDb_(),have={},add=[],upd={};
+      db.rows("명단").forEach(function(r){have[String(r["학번"]).trim()]=r;});
+      (p.rows||[]).forEach(function(x){
+        var hb=String(x[0]).trim(),nm=String(x[1]).trim(),cls=String(x[2]).trim();
+        if(!/^\d{4}$/.test(hb)||!nm)return;
+        var r=have[hb];
+        if(!r)add.push({"학번":hb,"이름":nm,"반":cls,"이메일":"","동의":"","도서부":""});
+        else if(String(r["이름"]).trim()!==nm||String(r["반"]).trim()!==cls)upd[hb]={"이름":nm,"반":cls};
+      });
+      if(add.length)db.addMany("명단",add);
+      if(Object.keys(upd).length)db.setMany("명단","학번",upd);
+      props.setProperty("importUsed|"+h,String(Date.now()));
+      out={ok:true,added:add.length,updated:Object.keys(upd).length,total:db.rows("명단").length};
+    }finally{lock.releaseLock();}
+    try{applySheetUi_();}catch(x){}
+  }catch(err){out={error:String(err&&err.message||err)};}
+  return ContentService.createTextOutput(JSON.stringify(out)).setMimeType(ContentService.MimeType.JSON);
+}
+function installTrigger_(){
+  try{installEditTriggers_();}catch(e){console.log("편집 감지: "+e.message);}
+  try{if(!ScriptApp.getProjectTriggers().some(function(t){return t.getHandlerFunction()==="recvMinute";}))
+    ScriptApp.newTrigger("recvMinute").timeBased().everyMinutes(1).create();}catch(e){console.log("수령대상 시계: "+e.message);}
+  var mine=ScriptApp.getProjectTriggers().filter(function(t){return t.getHandlerFunction()==="libDaily";});
+  if(mine.length===HOURS_.length)return false;
+  mine.forEach(function(t){ScriptApp.deleteTrigger(t);});
+  HOURS_.forEach(function(h){ScriptApp.newTrigger("libDaily").timeBased().everyDays(1).atHour(h).inTimezone("Asia/Seoul").create();});
+  return true;
+}
+
+function nextRound(){
+  var db=makeDb_();
+  var cur=db.rows("설정").filter(function(r){return r["항목"]==="차수";})[0];
+  var n=(Number(cur&&cur["값"])||1)+1;
+  try{
+    var ui=SpreadsheetApp.getUi();
+    if(ui.alert(n+"차를 시작할까요?","학생 낙엽판이 0칸에서 다시 시작합니다. 지난 글과 게시판은 그대로 남습니다.",ui.ButtonSet.OK_CANCEL)!==ui.Button.OK)return;
+  }catch(e){}
+  db.setConf("차수",String(n));
+  say_(n+"차를 시작했습니다.");
+}
