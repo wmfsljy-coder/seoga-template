@@ -35,7 +35,7 @@ function onOpen(){
 }
 
 /* 배포할 때마다 tools/deploy.py 가 바꾸는 판 표시. 새 판이 처음 열리면 뒷정리(firstRun)를 한 번 예약한다 */
-var CODE_VERSION="20261020-165428";
+var CODE_VERSION="20261020-190920";
 /* tools/.testkey 의 열쇠인지 (해시만 코드에 둔다) */
 function keyOk_(v){
   return Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256,String(v),Utilities.Charset.UTF_8)
@@ -913,12 +913,13 @@ function sheetDocNow(){var n=writeSheetDoc_(true);writeStartTab_();say_("‘안�
 function appUrl_(){try{return ScriptApp.getService().getUrl()||"";}catch(e){return "";}}
 /* ‘시작’ 탭: 이 시트를 연 선생님이 가장 먼저 볼 것 — 학생·선생님이 들어가는 주소 */
 function writeStartTab_(){
-  var ss=ss_(),url=appUrl_(),demo="https://wmfsljy-coder.github.io/seoga-template/";
+  var ss=ss_(),url=appUrl_(),demo="https://wmfsljy-coder.github.io/seoga-template/";   /* 시연본은 공개 템플릿 저장소에서(운영 저장소는 비공개) */
   var sh=ss.getSheetByName("시작");
   if(!sh){sh=ss.insertSheet("시작",0);}else{try{ss.setActiveSheet(sh);ss.moveActiveSheet(1);}catch(e){}}
   sh.clear();
   try{sh.clearConditionalFormatRules();}catch(e){}
-  var name=(function(){try{var r=ss.getSheetByName("설정").getDataRange().getValues().filter(function(x){return String(x[0])==="프로그램명";})[0];return r?String(r[1]):"서가";}catch(e){return "서가";}})();
+  var confOf=function(k,d){try{var r=ss.getSheetByName("설정").getDataRange().getValues().filter(function(x){return String(x[0])===k;})[0];return r&&String(r[1]).trim()?String(r[1]).trim():d;}catch(e){return d;}};
+  var name=confOf("프로그램명","서가"),folder=confOf("백업폴더",""),repo="https://github.com/wmfsljy-coder/seoga-template";
   var rows=[
     [name+" — 들어가는 주소",""],
     ["",""],
@@ -928,6 +929,9 @@ function writeStartTab_(){
     ["교실 게시용 안내문(QR)","앱에 관리자로 들어가 시상·인쇄 탭 → ‘교실 게시용 안내문’을 A4 로 인쇄하면 QR 이 함께 나옵니다."],
     ["관리자·담임 화면","같은 주소로 들어가면 교사 시트에 이름이 있는 선생님에게는 교사 화면이 보입니다."],
     ["둘러보기(가짜 자료)",demo],
+    ["다른 학교용 공개판(코드)",repo],
+    ["설치 안내(다른 학교용)",repo+"/blob/main/%EC%84%A4%EC%B9%98%EC%95%88%EB%82%B4.md"],
+    ["백업·서류 폴더",folder||"(설정 탭 ‘백업폴더’에 드라이브 폴더 주소를 적으면 여기에 나옵니다)"],
     ["",""],
     ["이 시트는","학생 이름·학번이 들어 있습니다. 학생에게 공유하지 마세요. 공유는 위 주소(웹앱)로만 하세요."],
     ["판 표시",CODE_VERSION]
@@ -938,7 +942,8 @@ function writeStartTab_(){
   sh.getRange(1,1,rows.length,2).setVerticalAlignment("top").setWrap(true);
   sh.setColumnWidth(1,190);sh.setColumnWidth(2,620);
   if(url)sh.getRange(3,2).setFormula('=HYPERLINK("'+url+'";"'+url+'")').setFontSize(12);
-  sh.getRange(8,2).setFormula('=HYPERLINK("'+demo+'";"'+demo+'")');
+  /* 주소 칸은 누르면 열리게 */
+  rows.forEach(function(r,i){var v=String(r[1]);if(i>=3&&/^https:\/\//.test(v))sh.getRange(i+1,2).setFormula('=HYPERLINK("'+v+'";"'+v.replace(/%[0-9A-F]{2}(%[0-9A-F]{2})*/g,function(m){try{return decodeURIComponent(m);}catch(e){return m;}})+'")');});
   sh.getRange(3,1,1,2).setBackground("#FBF6EA");
   try{sh.setFrozenRows(1);sh.getRange(1,3,1,1).activate();}catch(e){}
   return url;
