@@ -55,7 +55,8 @@ C().api("quizNextBook",{from:oldB,to:newB});
 must(plan()[2].split(";").includes(newB)&&!plan()[2].split(";").includes(oldB),"다음 주 책을 바꿈: "+oldB+" → "+newB);
 must(!books(W1).includes(oldB)&&books(W1).includes(newB)&&inWk(W1).length===5,"그 책 문제도 새 책으로 5개");
 let bad="";try{C().api("quizNextBook",{from:newB,to:books(W0)[0]});}catch(e){bad=e.message;}
-must(/이번 주/.test(bad),"이번 주 책으로는 못 바꿈");
+/* 다음 주가 새 달(추천 도서가 월요일에 바뀌는 주)이면 이번 주 책은 그 달 목록에 없어 다른 말로 막힌다 */
+must(/이번 주|그 달 추천 도서/.test(bad),"이번 주 책으로는 못 바꿈 ("+bad+")");
 /* 학생: 다음 주 책으로 좋은 문제를 내면 곧바로 다음 주 미리 보기에(은행 문제를 하나 덜어 냄) */
 const stuN=13;
 for(let i=0;i<stuN;i++)T["명단"].push({"학번":String(30300+i),"이름":"학생"+i,"반":"3-3","이메일":"t"+i+"@x","동의":"y"});

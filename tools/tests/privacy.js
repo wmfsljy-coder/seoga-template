@@ -1,7 +1,7 @@
 /* 개인정보 동의(2026-10-19): 학습지원 소프트웨어 필수기준 체크리스트 9개 항목을 덮는지.
    1-1 최소처리 · 1-2 목적 · 1-3 항목·보유기간 · 2-1 안전조치 · 3-1 열람/정정/삭제/처리정지
    4-1 만14세 미만 법정대리인 · 5-1 보호책임자 · 5-2 제3자 제공 · 5-3 위·수탁 */
-const fs=require("fs"),crypto=require("crypto");eval(fs.readFileSync(__dirname+"/../../core.gs","utf8")+";global.Core=Core;Core.CONF0.forEach(function(r){if(r[0]==="학교명")r[1]="한빛고등학교";if(r[0]==="추천묶음"||r[0]==="투표묶음")r[1]="2026-09~2026-10";});");
+const fs=require("fs"),crypto=require("crypto");eval(fs.readFileSync(__dirname+"/../../core.gs","utf8")+";global.Core=Core;Core.CONF0.forEach(function(r){if(r[0]==='학교명')r[1]='한빛고등학교';if(r[0]==='추천묶음'||r[0]==='투표묶음')r[1]='2026-09~2026-10';});");
 let NOW=new Date("2026-10-19T03:00:00Z"),EMAIL="";
 const T={};Object.keys(Core.HEAD).forEach(t=>T[t]=[]);
 const env={now:()=>NOW,email:()=>EMAIL,uid:()=>"u"+Math.random().toString(36).slice(2,8),hmac:s=>crypto.createHmac("sha256","testkey").update(String(s)).digest("hex"),http:()=>{throw 1},mail:()=>{}};

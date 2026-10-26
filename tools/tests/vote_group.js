@@ -2,7 +2,7 @@
    - 9월은 시험 운영: 9·10월을 한 투표 기간으로 묶어 표를 새로 세지 않고 이어 모은 뒤 10월 말에 한 번 시상
    - 묶음 안에서는 9월에 올라온 글도 계속 투표 후보, 묶음이 끝나면 다시 이레 창
    - 선생님도 투표한다: 학생 한 표와 똑같이 세고, 한 주 부문마다 5표(2026-09-28) */
-const fs=require("fs");eval(fs.readFileSync(__dirname+"/../../core.gs","utf8")+";global.Core=Core;Core.CONF0.forEach(function(r){if(r[0]==="학교명")r[1]="한빛고등학교";if(r[0]==="추천묶음"||r[0]==="투표묶음")r[1]="2026-09~2026-10";});");
+const fs=require("fs");eval(fs.readFileSync(__dirname+"/../../core.gs","utf8")+";global.Core=Core;Core.CONF0.forEach(function(r){if(r[0]==='학교명')r[1]='한빛고등학교';if(r[0]==='추천묶음'||r[0]==='투표묶음')r[1]='2026-09~2026-10';});");
 let NOW=new Date("2026-10-20T03:00:00Z");
 const T={};Object.keys(Core.HEAD).forEach(t=>T[t]=[]);
 const env={now:()=>NOW,email:()=>"",uid:()=>"u"+Math.random().toString(36).slice(2,8),hmac:s=>"h"+s,http:()=>{throw 1},mail:()=>{}};

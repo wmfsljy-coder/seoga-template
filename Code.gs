@@ -35,7 +35,7 @@ function onOpen(){
 }
 
 /* 배포할 때마다 tools/deploy.py 가 바꾸는 판 표시. 새 판이 처음 열리면 뒷정리(firstRun)를 한 번 예약한다 */
-var CODE_VERSION="20261020-190920";
+var CODE_VERSION="20261026-093339";
 /* tools/.testkey 의 열쇠인지 (해시만 코드에 둔다) */
 function keyOk_(v){
   return Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256,String(v),Utilities.Charset.UTF_8)
@@ -622,7 +622,7 @@ function setup(){
   ScriptApp.getProjectTriggers().forEach(function(t){if(t.getHandlerFunction()==="firstRun")ScriptApp.deleteTrigger(t);});
   ScriptApp.newTrigger("firstRun").timeBased().after(30*1000).create();
   var lib="\n독서로 확인과 이번 달 추천 도서 뽑기는 30초 뒤 따로 시작해 1~3분 걸립니다. 끝나면 '설정' 탭 '도서확인' 칸에 시각이 찍힙니다(Apps Script 왼쪽 '실행' 메뉴에서 firstRun 기록도 볼 수 있음).";
-  say_("설정을 마쳤습니다."+lib+(trig?"\n매일 7시·15시·0시에 독서로 소장·대출을 확인하고, 매달 1일에 이번 달 추천 도서를 새로 뽑습니다.":"")+(made.length?"\n만든 시트: "+made.join(", "):"")+msg+
+  say_("설정을 마쳤습니다."+lib+(trig?"\n매일 7시·15시·0시에 독서로 소장·대출을 확인하고, 달이 바뀌는 주 월요일에 이번 달 추천 도서를 새로 뽑습니다.":"")+(made.length?"\n만든 시트: "+made.join(", "):"")+msg+
     "\n\n다음: 명단 시트에 학번·이름·반(3-2 형식)을 붙여넣고(이메일 칸은 비워 두면 학생이 처음 들어올 때 스스로 등록), "+
     "[배포 > 새 배포 > 웹 앱]에서 실행: 나 / 액세스: 학교 도메인 내 모든 사용자 로 배포하세요.");
 }
@@ -805,8 +805,9 @@ function recvMinute(){
   /* 4분마다 캐시를 미리 채운다(아무도 안 들어온 뒤 첫 사람이 시트를 새로 읽지 않게) */
   try{if(Date.now()-(Number(P.getProperty("warmAt"))||0)>=4*60*1000-5000){P.setProperty("warmAt",String(Date.now()));var nw=makeDb_().warm(PRELOAD_);if(nw)P.setProperty("warmLast",new Date().toISOString()+" "+nw);}}catch(e){console.log("캐시 채우기: "+e.message);}
   if(!P.getProperty("recvDirty"))return 0;
-  /* 금요일 점심 12시~2시는 1분마다, 나머지는 바뀐 것이 있어도 10분에 한 번(2026-10-12 회장님: 점심시간에 다 배부) */
-  var hm=Utilities.formatDate(new Date(),"Asia/Seoul","u HH:mm"),busy=hm.charAt(0)==="5"&&hm.slice(2)>="12:00"&&hm.slice(2)<"14:00";
+  /* 평일 점심 12시~2시는 1분마다, 나머지는 바뀐 것이 있어도 10분에 한 번(2026-10-12 회장님: 점심시간에 다 배부).
+     2026-10-21: 수령 날이 금요일이 아닌 주(학교 일정)도 있어 평일 점심 모두로 — 바뀐 것이 있을 때만 돌아서 부담 없음 */
+  var hm=Utilities.formatDate(new Date(),"Asia/Seoul","u HH:mm"),busy=hm.charAt(0)>="1"&&hm.charAt(0)<="5"&&hm.slice(2)>="12:00"&&hm.slice(2)<"14:00";
   if(!busy&&Date.now()-(Number(P.getProperty("recvLast"))||0)<10*60*1000)return 0;
   var lk=LockService.getScriptLock();if(!lk.tryLock(15000))return 0;
   try{
