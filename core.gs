@@ -18,7 +18,7 @@ var HEAD={
   "수령기간":["시작","끝","메모"],
   "주제":["주","주제","설명","영역","숨김"],
   "이벤트":["이름","방식","시작","끝","값","보상","대상","종류","메모","숨김","당첨","기록"],
-  "건의":["id","시각","학번","이름","반","내용","답변","답변자","답변시각","상태"],
+  "건의":["id","시각","학번","이름","반","내용","답변","답변자","답변시각","상태","치움"],
   "권장도서":["제목","지은이","영역","출처","권수","청구기호","ISBN","출판사","발행년","뺌"],
   "장서목록":["제목","지은이","출판사","발행년","청구기호","권수","분야","중분류","ISBN","자료실"],
   "수령대상":["수령","시작","끝","학번","이름","반","별","상품권","배부","처리자","처리시각","수령확인","확인시각"],
@@ -1371,6 +1371,10 @@ function make(db,env){
       try{db.rows("공지").forEach(function(r){if(S(r["제목"])===tv&&S(r["내용"]).indexOf(tvOld)>=0)
         db.set("공지","id",S(r["id"]),{"내용":S(r["내용"]).replace(tvOld," 표는 달마다 새로 세고, 글이 올라온 날부터 7일 동안 투표할 수 있어요.")});});}catch(e){}
       setConf("공지1026b판","1");}
+    /* 2026-10-26 회장님: 예전 '지우기'로 삭제된 건의를 되살린다(학생이 자기 건의·답변을 다시 보게). 한 번만 */
+    if(S(conf()["건의되살림판"])!=="1"){
+      try{db.rows("건의").forEach(function(r){if(S(r["상태"])==="삭제")db.set("건의","id",S(r["id"]),{"상태":S(r["답변"])?"답변":"대기"});});}catch(e){}
+      setConf("건의되살림판","1");}
     /* 2026-10-25 회장님: 무지개 별 주간 공지를 오늘(일)부터 바로 보이게(처음엔 10/26 월요일부터). 한 번만 */
     if(S(conf()["무지개공지1025판"])!=="1"){
       try{if(today(env.now())<="2026-10-26")db.rows("공지").forEach(function(r){
@@ -3372,7 +3376,7 @@ function make(db,env){
     return db.rows("건의").filter(function(r){return S(r["상태"])!=="삭제";})
       .sort(function(x,y){return S(y["시각"])<S(x["시각"])?-1:1;})
       .map(function(r){return {id:S(r["id"]),at:S(r["시각"]).slice(0,16),hakbun:S(r["학번"]),name:S(r["이름"]),cls:S(r["반"]),
-        text:S(r["내용"]),reply:S(r["답변"]),who:S(r["답변자"]),replyAt:S(r["답변시각"]).slice(0,16)};});
+        text:S(r["내용"]),reply:S(r["답변"]),who:S(r["답변자"]),replyAt:S(r["답변시각"]).slice(0,16),tidy:S(r["치움"])==="Y"};});
   }
   /* ── 이벤트 ──
      '이벤트' 시트 한 줄이 이벤트 하나입니다. 방식에 따라 값·보상의 뜻이 다릅니다.
@@ -4220,7 +4224,9 @@ function make(db,env){
       return {ok:true};},
     ideaReply:function(a,p){admin(a);
       var r=db.rows("건의").filter(function(x){return S(x["id"])===S(p.id);})[0];if(!r)fail("건의를 찾지 못했습니다.");
-      if(p.del)return db.set("건의","id",S(p.id),{"상태":"삭제"}),{ok:true};
+      /* 지우기 → 관리자 목록에서만 치우기(2026-10-26 회장님: 지우면 학생도 자기 건의·답변을 못 봐서). 학생 건의함에는 그대로 */
+      if(p.del)return db.set("건의","id",S(p.id),{"치움":"Y"}),{ok:true};
+      if(p.undel)return db.set("건의","id",S(p.id),{"치움":""}),{ok:true};
       db.set("건의","id",S(p.id),{"답변":S(p.text).slice(0,500),"답변자":a.name+" 선생님","답변시각":stamp(env.now()),"상태":S(p.text)?"답변":"대기"});
       return {ok:true};},
     teacherOk:function(a,p){admin(a);
